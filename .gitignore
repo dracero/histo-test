@@ -1,0 +1,16 @@
+# Environment
+.env
+.venv/
+
+# Python
+__pycache__/
+*.pyc
+*.egg-info/
+
+# Extracted data
+imagenes_extraidas/
+logs/
+
+# Generated files
+trayectoria_neo4j.json
+temario_histologia.json

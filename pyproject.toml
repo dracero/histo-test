@@ -1,0 +1,53 @@
+[project]
+name = "rag-histologia-neo4j"
+version = "4.1.0"
+description = "RAG Multimodal de Histología con ImageBind + Neo4j"
+requires-python = ">=3.10"
+dependencies = [
+    # Neo4j
+    "neo4j>=5.0",
+
+    # PDF processing
+    "PyPDF2>=3.0",
+    "pdf2image>=1.16",
+    "pytesseract>=0.3",
+
+    # LangChain / LangGraph
+    "langchain-google-genai>=2.0",
+    "langchain-core>=0.3",
+    "langgraph>=0.2",
+
+    # LangSmith observability
+    "langsmith>=0.1",
+
+    # ML / Torch
+    "torch>=2.0",
+    "numpy>=1.24",
+    "Pillow>=10.0",
+
+    # Async
+    "nest-asyncio>=1.5",
+
+    # Environment
+    "python-dotenv>=1.0",
+
+    # CONCH (Mahmood Lab)
+    "conch @ git+https://github.com/mahmoodlab/CONCH.git",
+
+    # UNI / UNI2-h (Mahmood Lab) via timm
+    "timm>=0.9.12",
+    "huggingface-hub",
+    "einops",
+
+    # Server (fullstack A2UI)
+    "fastapi>=0.111.0",
+    "uvicorn>=0.30.0",
+    "python-multipart>=0.0.6",
+]
+
+[tool.setuptools]
+packages = []
+
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
