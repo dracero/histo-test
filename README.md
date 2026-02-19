@@ -31,15 +31,15 @@ graph TD
     end
 
     %% Flujo
-    UI -->|1. POST /api/chat (Texto + Img Base64)| API
-    API -->|2. Invoca| RAG
-    RAG -->|3. Ejecuta| LG
-    LG -->|4. Consulta Híbrida| N4J
-    LG -->|5. Genera Embeddings| EMB
-    LG -->|6. Genera Respuesta| GEM
-    RAG -- Devuelve Respuesta + Metadata --> API
-    API -- JSON Response --> JS
-    JS -- Renderiza Markdown/A2UI --> UI
+    UI -- "1. POST /api/chat (Texto + Img)" --> API
+    API -- "2. Invoca" --> RAG
+    RAG -- "3. Ejecuta" --> LG
+    LG -- "4. Consulta Híbrida" --> N4J
+    LG -- "5. Genera Embeddings" --> EMB
+    LG -- "6. Genera Respuesta" --> GEM
+    RAG -- "Devuelve Respuesta + Metadata" --> API
+    API -- "JSON Response" --> JS
+    JS -- "Renderiza Markdown/A2UI" --> UI
 ```
 
 ---
