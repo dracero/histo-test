@@ -11,23 +11,23 @@ El sistema sigue una arquitectura cliente-servidor desacoplada, donde el backend
 ```mermaid
 graph TD
     subgraph "Frontend (Cliente Web)"
-        UI[index.html]
-        JS[app.js]
-        CSS[style.css]
-        A2UI[Panel A2UI]
+        UI["index.html"]
+        JS["app.js"]
+        CSS["style.css"]
+        A2UI["Panel A2UI"]
     end
 
     subgraph "Backend (Servidor)"
-        API[FastAPI Server (server.py)]
-        RAG[Motor RAG (ne4j-histo.py)]
-        LG[LangGraph State Machine]
+        API["FastAPI Server (server.py)"]
+        RAG["Motor RAG (ne4j-histo.py)"]
+        LG["LangGraph State Machine"]
     end
 
     subgraph "Persistencia & IA"
-        N4J[(Neo4j Graph DB)]
-        PDF[PDF Documents]
-        GEM[Gemini 1.5 Pro]
-        EMB[CONCH / UNI Embeddings]
+        N4J[("Neo4j Graph DB")]
+        PDF["PDF Documents"]
+        GEM["Gemini 1.5 Pro"]
+        EMB["CONCH / UNI Embeddings"]
     end
 
     %% Flujo
