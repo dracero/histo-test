@@ -1,5 +1,6 @@
 <!DOCTYPE html>
 <html lang="es">
+
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -7,6 +8,7 @@
     <meta name="description" content="Sistema RAG Multimodal de Histología con Neo4j, CONCH/UNI y A2UI">
     <link rel="stylesheet" href="/style.css">
 </head>
+
 <body>
 
     <!-- Header -->
@@ -22,7 +24,6 @@
             <div class="status-dot" id="status-dot"></div>
             <span class="status-text" id="status-text">Conectando...</span>
             <button class="header-btn" onclick="toggleTemario()" title="Ver temario">📚 Temario</button>
-            <button class="header-btn" id="a2ui-toggle-btn" onclick="toggleA2UIPanel()" title="Ver A2UI JSON">{ } A2UI</button>
             <button class="header-btn" onclick="limpiarImagen()" title="Limpiar imagen activa">🗑️ Imagen</button>
         </div>
     </header>
@@ -45,16 +46,6 @@
         </div>
     </div>
 
-    <!-- A2UI Panel -->
-    <div class="a2ui-panel" id="a2ui-panel">
-        <div class="a2ui-panel-header">
-            <h4>📋 Respuesta A2UI JSON</h4>
-            <button class="temario-close" onclick="toggleA2UIPanel()">×</button>
-        </div>
-        <div class="a2ui-panel-content" id="a2ui-content">
-            <pre>Envía un mensaje para ver la respuesta A2UI</pre>
-        </div>
-    </div>
 
     <!-- Temario Overlay -->
     <div class="temario-overlay" id="temario-overlay" onclick="toggleTemario()"></div>
@@ -80,7 +71,8 @@
         </div>
         <div class="input-row">
             <div class="input-actions">
-                <button class="action-btn" onclick="document.getElementById('image-input').click()" title="Subir imagen">
+                <button class="action-btn" onclick="document.getElementById('image-input').click()"
+                    title="Subir imagen">
                     🖼️
                 </button>
                 <input type="file" id="image-input" accept="image/*" onchange="handleImageSelect(event)">
@@ -99,4 +91,5 @@
 
     <script src="/app.js"></script>
 </body>
+
 </html>

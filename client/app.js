@@ -10,7 +10,6 @@ const API_BASE = '';
 // ── State ───────────────────────────────────────────────────────────
 let pendingImageBase64 = null;
 let pendingImageName = null;
-let lastA2UIResponse = null;
 let isWaiting = false;
 
 // ── DOM refs ────────────────────────────────────────────────────────
@@ -72,35 +71,24 @@ async function sendMessage() {
             body.image_filename = pendingImageName;
         }
 
-        // Fire both endpoints in parallel
-        const [chatRes, a2uiRes] = await Promise.all([
-            fetch(`${API_BASE}/api/chat`, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(body),
-            }),
-            fetch(`${API_BASE}/api/chat/a2ui`, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(body),
-            }).catch(() => null),
-        ]);
+        // Single request — avoid duplicate RAG execution
+        const chatRes = await fetch(`${API_BASE}/api/chat`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(body),
+        });
 
         removeTyping(typingEl);
 
+        console.log("Response status:", chatRes.status);
         if (!chatRes.ok) {
             const err = await chatRes.json().catch(() => ({ detail: 'Error desconocido' }));
+            console.error("Chat error:", err);
             addMessage('assistant', `❌ Error: ${err.detail || chatRes.statusText}`);
         } else {
             const data = await chatRes.json();
+            console.log("Chat data received:", data);
             addMessage('assistant', data.respuesta, null, data);
-        }
-
-        // A2UI panel update
-        if (a2uiRes && a2uiRes.ok) {
-            lastA2UIResponse = await a2uiRes.json();
-            const a2uiContent = document.getElementById('a2ui-content');
-            a2uiContent.innerHTML = `<pre>${escapeHtml(JSON.stringify(lastA2UIResponse, null, 2))}</pre>`;
         }
 
     } catch (err) {
@@ -333,20 +321,6 @@ async function loadTemario() {
     }
 }
 
-// ── A2UI Panel ──────────────────────────────────────────────────────
-function toggleA2UIPanel() {
-    const panel = document.getElementById('a2ui-panel');
-    const btn = document.getElementById('a2ui-toggle-btn');
-    const isVisible = panel.classList.contains('visible');
-
-    if (isVisible) {
-        panel.classList.remove('visible');
-        btn.classList.remove('active');
-    } else {
-        panel.classList.add('visible');
-        btn.classList.add('active');
-    }
-}
 
 // ── Utils ───────────────────────────────────────────────────────────
 function escapeHtml(text) {

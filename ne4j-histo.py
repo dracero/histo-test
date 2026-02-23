@@ -35,15 +35,10 @@ from dotenv import load_dotenv
 # Cargar variables de entorno desde .env
 load_dotenv()
 
-# CONCH & UNI
+# UNI & PLIP
 import timm
+from transformers import CLIPProcessor, CLIPModel
 from huggingface_hub import login
-try:
-    from conch.open_clip_custom import create_model_from_pretrained
-    CONCH_AVAILABLE = True
-except ImportError:
-    CONCH_AVAILABLE = False
-    print("❌ CONCH no instalado (pip install git+https://github.com/mahmoodlab/CONCH.git)")
 
 # Verificar HF_TOKEN
 HF_TOKEN = os.getenv("HF_TOKEN")
@@ -54,7 +49,7 @@ if HF_TOKEN:
     except Exception as e:
         print(f"⚠️ Error login HF: {e}")
 else:
-    print("⚠️ HF_TOKEN no encontrado en .env (necesario para CONCH/UNI)")
+    print("⚠️ HF_TOKEN no encontrado en .env (necesario para UNI)")
 
 # Neo4j
 from neo4j import AsyncGraphDatabase, AsyncDriver
@@ -85,17 +80,17 @@ nest_asyncio.apply()
 # CONFIGURACIÓN GLOBAL
 SIMILARITY_THRESHOLD  = 0.22
 # Dimensiones de embeddings
-DIM_TEXTO_GEMINI = 768
-DIM_IMG_CONCH    = 512
+DIM_TEXTO_GEMINI = 3072
 DIM_IMG_UNI      = 1024
+DIM_IMG_PLIP     = 512
 
 DIRECTORIO_IMAGENES   = os.path.join(os.path.dirname(os.path.abspath(__file__)), "imagenes_extraidas")
 DIRECTORIO_PDFS       = os.path.join(os.path.dirname(os.path.abspath(__file__)), "pdf")
 
 # Índices Neo4j
 INDEX_TEXTO = "histo_text"      # Gemini Text
-INDEX_CONCH = "histo_img_conch" # CONCH Image
 INDEX_UNI   = "histo_img_uni"   # UNI Image
+INDEX_PLIP  = "histo_img_plip"  # PLIP Image
 
 NEO4J_GRAPH_DEPTH     = 2
 SIMILAR_IMG_THRESHOLD = 0.85 # Más alto para modelos especializados
@@ -132,6 +127,38 @@ ANCLAS_SEMANTICAS_HISTOLOGIA = [
 def _safe(value, default: str = "") -> str:
     return value if isinstance(value, str) and value else default
 
+async def invoke_con_reintento(llm, messages, max_retries=3):
+    import asyncio
+    for attempt in range(max_retries):
+        try:
+            return await llm.ainvoke(messages)
+        except Exception as e:
+            err_str = str(e)
+            if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str:
+                if attempt < max_retries - 1:
+                    print(f"   ⚠️ Límite de cuota API (429) - reintentando en 15s... (Intento {attempt+1}/{max_retries})")
+                    await asyncio.sleep(15)
+                else:
+                    raise e
+            else:
+                raise e
+
+def invoke_con_reintento_sync(llm, messages, max_retries=3):
+    import time
+    for attempt in range(max_retries):
+        try:
+            return llm.invoke(messages)
+        except Exception as e:
+            err_str = str(e)
+            if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str:
+                if attempt < max_retries - 1:
+                    print(f"   ⚠️ Límite de cuota API (429) - reintentando en 15s... (Intento {attempt+1}/{max_retries})")
+                    time.sleep(15)
+                else:
+                    raise e
+            else:
+                raise e
+
 
 # =============================================================================
 # LANGSMITH
@@ -167,38 +194,35 @@ LANGSMITH_ENABLED, traceable, langsmith_client = setup_langsmith_environment()
 # WRAPPERS DE MODELOS (CONCH & UNI)
 # =============================================================================
 
-class ConchWrapper:
+class PlipWrapper:
     def __init__(self, device):
         self.device = device
         self.model = None
-        self.preprocess = None
-        
+        self.processor = None
+
     def load(self):
-        print("🔄 Cargando CONCH (MahmoodLab)...")
+        print("🔄 Cargando PLIP (vinid/plip)...")
         try:
-            # Token debe estar configurado vía huggingface_hub.login()
-            self.model, self.preprocess = create_model_from_pretrained(
-                "conch_ViT-B-16", 
-                "hf_hub:MahmoodLab/CONCH",
-                hf_auth_token=os.getenv("HF_TOKEN"),
-                device=self.device
-            )
-            self.model.eval()
-            print("✅ CONCH cargado")
+            self.model = CLIPModel.from_pretrained("vinid/plip").to(self.device).eval()
+            self.processor = CLIPProcessor.from_pretrained("vinid/plip")
+            print("✅ PLIP cargado")
         except Exception as e:
-            print(f"❌ Error cargando CONCH: {e}")
+            print(f"❌ Error cargando PLIP: {e}")
 
     def embed_image(self, image_path: str) -> np.ndarray:
-        if not self.model: return np.zeros(DIM_IMG_CONCH)
+        if not self.model: return np.zeros(DIM_IMG_PLIP)
         try:
             image = Image.open(image_path).convert('RGB')
-            image_tensor = self.preprocess(image).unsqueeze(0).to(self.device)
+            inputs = self.processor(images=image, return_tensors="pt")
+            pixel_values = inputs["pixel_values"].to(self.device)
             with torch.inference_mode():
-                emb = self.model.encode_image(image_tensor, proj_contrast=False, normalize=True)
-            return emb.cpu().numpy().flatten()
+                vision_out = self.model.vision_model(pixel_values=pixel_values)
+                pooled = vision_out.pooler_output
+                image_features = self.model.visual_projection(pooled)  # [1, 512]
+            return image_features.cpu().numpy().flatten()
         except Exception as e:
-            print(f"⚠️ Error embedding CONCH: {e}")
-            return np.zeros(DIM_IMG_CONCH)
+            print(f"⚠️ Error embedding PLIP: {e}")
+            return np.zeros(DIM_IMG_PLIP)
 
 class UniWrapper:
     def __init__(self, device):
@@ -276,7 +300,7 @@ class Neo4jClient:
             return [dict(record) for record in await result.data()]
 
     async def crear_esquema(self):
-        print("🏗️ Creando esquema Neo4j (v4.2 CONCH+UNI)...")
+        print("🏗️ Creando esquema Neo4j (v4.2 UNI + PLIP)...")
         constraints = [
             "CREATE CONSTRAINT chunk_id IF NOT EXISTS FOR (c:Chunk) REQUIRE c.id IS UNIQUE",
             "CREATE CONSTRAINT imagen_id IF NOT EXISTS FOR (i:Imagen) REQUIRE i.id IS UNIQUE",
@@ -302,21 +326,21 @@ class Neo4jClient:
                 `vector.similarity_function`: 'cosine'
             }}}}
             """,
-            # 2. IMAGEN CONCH
-            f"""
-            CREATE VECTOR INDEX {INDEX_CONCH} IF NOT EXISTS
-            FOR (i:Imagen) ON i.embedding_conch
-            OPTIONS {{indexConfig: {{
-                `vector.dimensions`: {DIM_IMG_CONCH},
-                `vector.similarity_function`: 'cosine'
-            }}}}
-            """,
-            # 3. IMAGEN UNI
+            # 2. IMAGEN UNI
             f"""
             CREATE VECTOR INDEX {INDEX_UNI} IF NOT EXISTS
             FOR (i:Imagen) ON i.embedding_uni
             OPTIONS {{indexConfig: {{
                 `vector.dimensions`: {DIM_IMG_UNI},
+                `vector.similarity_function`: 'cosine'
+            }}}}
+            """,
+            # 3. IMAGEN PLIP
+            f"""
+            CREATE VECTOR INDEX {INDEX_PLIP} IF NOT EXISTS
+            FOR (i:Imagen) ON i.embedding_plip
+            OPTIONS {{indexConfig: {{
+                `vector.dimensions`: {DIM_IMG_PLIP},
                 `vector.similarity_function`: 'cosine'
             }}}}
             """,
@@ -387,13 +411,13 @@ class Neo4jClient:
 
     async def upsert_imagen(self, imagen_id: str, path: str, fuente: str,
                              pagina: int, ocr_text: str, 
-                             emb_conch: List[float], emb_uni: List[float]):
+                             emb_uni: List[float], emb_plip: List[float]):
         await self.run("""
             MERGE (i:Imagen {id: $id})
             SET i.path = $path, i.fuente = $fuente,
                 i.pagina = $pagina, i.ocr_text = $ocr_text,
-                i.embedding_conch = $emb_conch,
-                i.embedding_uni = $emb_uni
+                i.embedding_uni = $emb_uni,
+                i.embedding_plip = $emb_plip
             WITH i
             MERGE (pdf:PDF {nombre: $fuente})
             MERGE (i)-[:PERTENECE_A]->(pdf)
@@ -402,14 +426,14 @@ class Neo4jClient:
         """, {
             "id": imagen_id, "path": path, "fuente": fuente,
             "pagina": pagina, "ocr_text": ocr_text, 
-            "emb_conch": emb_conch, "emb_uni": emb_uni
+            "emb_uni": emb_uni, "emb_plip": emb_plip
         })
 
     async def crear_relaciones_similitud(self, umbral: float = SIMILAR_IMG_THRESHOLD):
-        # Usamos CONCH para similitud visual (multimodal)
-        print(f"🔗 Creando relaciones :SIMILAR_A (usando CONCH, umbral={umbral})...")
+        # Usamos UNI para similitud visual (multimodal)
+        print(f"🔗 Creando relaciones :SIMILAR_A (usando UNI, umbral={umbral})...")
         imagenes = await self.run(
-            "MATCH (i:Imagen) WHERE i.embedding_conch IS NOT NULL RETURN i.id AS id, i.embedding_conch AS emb"
+            "MATCH (i:Imagen) WHERE i.embedding_uni IS NOT NULL RETURN i.id AS id, i.embedding_uni AS emb"
         )
         if len(imagenes) < 2:
             return
@@ -425,7 +449,7 @@ class Neo4jClient:
                 SET r.score = score
                 RETURN count(*) AS n
             """, {
-                "index": INDEX_CONCH,
+                "index": INDEX_UNI,
                 "emb": img["emb"], "id": img["id"], "umbral": umbral
             })
             creadas += resultado[0]["n"] if resultado else 0
@@ -509,32 +533,28 @@ class Neo4jClient:
             // Expansión 1: otros nodos en el mismo PDF (excluir el nodo origen)
             OPTIONAL MATCH (n)-[:PERTENECE_A]->(pdf:PDF)<-[:PERTENECE_A]-(vecino_pdf)
             WHERE vecino_pdf.id <> nid
+            WITH n, nid, collect(DISTINCT vecino_pdf)[..5] AS list_pdf
 
             // Expansión 2: chunks que comparten entidades (excluir el nodo origen)
             OPTIONAL MATCH (n)-[:MENCIONA]->(entidad)<-[:MENCIONA]-(vecino_entidad:Chunk)
             WHERE vecino_entidad.id <> nid
+            WITH n, nid, list_pdf, collect(DISTINCT vecino_entidad)[..5] AS list_ent
 
             // Expansión 3: imágenes similares por embedding
             OPTIONAL MATCH (n)-[:SIMILAR_A]-(vecino_similar:Imagen)
+            WITH n, nid, list_pdf, list_ent, collect(DISTINCT vecino_similar)[..5] AS list_sim
 
             // Expansión 4: imágenes de la misma página que el chunk
             OPTIONAL MATCH (n)-[:PERTENECE_A]->(pdf2:PDF)<-[:PERTENECE_A]-(img_pag:Imagen)
+            WITH nid, list_pdf, list_ent, list_sim, collect(DISTINCT img_pag)[..5] AS list_pag
 
             WITH $ids AS ids_originales,
-                 collect(DISTINCT vecino_pdf) +
-                 collect(DISTINCT vecino_entidad) +
-                 collect(DISTINCT vecino_similar) +
-                 collect(DISTINCT img_pag) AS vecinos_raw
+                 list_pdf + list_ent + list_sim + list_pag AS vecinos_raw
 
-            // Filtrar nulls antes del UNWIND
-            WITH ids_originales,
-                 [v IN vecinos_raw WHERE v IS NOT NULL] AS vecinos
+            UNWIND vecinos_raw AS v
 
-            UNWIND vecinos AS v
-
-            // WITH intermedio obligatorio antes del WHERE en post-UNWIND
             WITH v, ids_originales
-            WHERE NOT v.id IN ids_originales
+            WHERE v IS NOT NULL AND NOT v.id IN ids_originales
 
             RETURN DISTINCT
                 v.id AS id,
@@ -573,13 +593,13 @@ class Neo4jClient:
 
     async def busqueda_hibrida(self,
                                 texto_embedding: Optional[List[float]],
-                                imagen_embedding_conch: Optional[List[float]],
                                 imagen_embedding_uni: Optional[List[float]],
+                                imagen_embedding_plip: Optional[List[float]],
                                 entidades: Dict[str, List[str]],
                                 top_k: int = 10) -> List[Dict]:
         res_texto = []
-        res_conch = []
         res_uni   = []
+        res_plip  = []
         res_ent   = []
         res_vec   = []
 
@@ -587,19 +607,19 @@ class Neo4jClient:
         if texto_embedding:
             res_texto = await self.busqueda_vectorial(texto_embedding, INDEX_TEXTO, top_k)
 
-        # 2. Búsqueda Imagen CONCH
-        if imagen_embedding_conch:
-            res_conch = await self.busqueda_vectorial(imagen_embedding_conch, INDEX_CONCH, top_k)
-
-        # 3. Búsqueda Imagen UNI
+        # 2. Búsqueda Imagen UNI
         if imagen_embedding_uni:
             res_uni = await self.busqueda_vectorial(imagen_embedding_uni, INDEX_UNI, top_k)
+
+        # 3. Búsqueda Imagen PLIP
+        if imagen_embedding_plip:
+            res_plip = await self.busqueda_vectorial(imagen_embedding_plip, INDEX_PLIP, top_k)
 
         # 4. Entidades
         res_ent = await self.busqueda_por_entidades(entidades, top_k)
 
         # Vecindad sobre los mejores
-        todos = res_texto + res_conch + res_uni
+        todos = res_texto + res_uni + res_plip
         top_ids = [r["id"] for r in todos[:6] if r.get("id")]
         if top_ids:
             res_vec = await self.expandir_vecindad(top_ids)
@@ -619,15 +639,15 @@ class Neo4jClient:
 
         # Pesos ajustados
         agregar(res_texto, 0.45) # Texto sigue siendo fundamental
-        agregar(res_conch, 0.35) # CONCH es muy fuerte
         agregar(res_uni,   0.35) # UNI complemento visual
+        agregar(res_plip,  0.35) # PLIP complemento visual
         agregar(res_ent,   0.25)
         agregar(res_vec,   0.15)
 
         final = sorted(combined.values(), key=lambda x: x["similitud"], reverse=True)
 
-        print(f"   📊 Híbrida: Txt={len(res_texto)} | CONCH={len(res_conch)} | "
-              f"UNI={len(res_uni)} | Ent={len(res_ent)} | Vec={len(res_vec)} -> {len(final)}")
+        print(f"   📊 Híbrida: Txt={len(res_texto)} | "
+              f"UNI={len(res_uni)} | PLIP={len(res_plip)} | Ent={len(res_ent)} | Vec={len(res_vec)} -> {len(final)}")
 
         return final[:15]
 
@@ -701,7 +721,7 @@ class SemanticMemory:
     def _update_summary(self):
         try:
             if len(self.conversations) > 6:
-                resp = self.llm.invoke([
+                resp = invoke_con_reintento_sync(self.llm, [
                     SystemMessage(content="Resume estas consultas de histología manteniendo términos técnicos:"),
                     HumanMessage(content=self.direct_history)
                 ])
@@ -810,7 +830,7 @@ Responde ÚNICAMENTE en JSON válido (sin backticks):
 {{"valido": true/false, "tema_encontrado": "tema más cercano o null", "confianza": 0.0-1.0, "motivo": "explicación breve"}}"""
 
         try:
-            resp      = await self.llm.ainvoke([
+            resp      = await invoke_con_reintento(self.llm, [
                 SystemMessage(content=system),
                 HumanMessage(content=f"CONSULTA: {consulta}")
             ])
@@ -908,7 +928,7 @@ class ExtractorTemario:
             "Un tema por línea, sin bullets. Solo la lista."
         )
         try:
-            resp = await self.llm.ainvoke([
+            resp = await invoke_con_reintento(self.llm, [
                 SystemMessage(content=system),
                 HumanMessage(content=f"TEXTO:\n{muestra}")
             ])
@@ -941,7 +961,7 @@ class ExtractorEntidades:
             "Máximo 3 items por categoría. Si no hay, lista vacía."
         )
         try:
-            resp = await self.llm.ainvoke([
+            resp = await invoke_con_reintento(self.llm, [
                 SystemMessage(content=system),
                 HumanMessage(content=texto[:500])
             ])
@@ -987,8 +1007,8 @@ class AgentState(TypedDict):
     messages:                    Annotated[list, operator.add]
     consulta_texto:              str
     imagen_path:                 Optional[str]
-    imagen_embedding_conch:      Optional[List[float]]
     imagen_embedding_uni:        Optional[List[float]]
+    imagen_embedding_plip:       Optional[List[float]]
     texto_embedding:             Optional[List[float]]
     contexto_memoria:            str
     contenido_base:              str
@@ -1000,7 +1020,7 @@ class AgentState(TypedDict):
     resultados_validos:          List[Dict[str, Any]]
     contexto_documentos:         str
     respuesta_final:             str
-    trayectoria:                 Annotated[List[Dict[str, Any]], operator.add]
+    trayectoria:                 List[Dict[str, Any]]
     user_id:                     str
     tiempo_inicio:               float
     analisis_visual:             Optional[str]
@@ -1033,8 +1053,8 @@ class AsistenteHistologiaNeo4j:
         self.memory_saver    = None
         self.contenido_base  = ""
 
-        self.conch = None
         self.uni   = None
+        self.plip  = None
         self.embeddings = None  # Google Embeddings
         self.embed_dim = DIM_TEXTO_GEMINI
 
@@ -1046,7 +1066,15 @@ class AsistenteHistologiaNeo4j:
         self.clasificador_semantico: Optional[ClasificadorSemantico] = None
 
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
-        print("✅ AsistenteHistologiaNeo4j v4.1 inicializado")
+        if self.device == "cuda":
+            try:
+                cap = torch.cuda.get_device_capability(0)
+                if cap[0] < 7:
+                    print(f"⚠️ GPU incompatible detectada (sm_{cap[0]}{cap[1]}). Forzando CPU para evitar fallback_error.")
+                    self.device = "cpu"
+            except:
+                pass
+        print(f"✅ AsistenteHistologiaNeo4j v4.1 inicializado en {self.device}")
 
     def _setup_apis(self):
         os.environ["GOOGLE_API_KEY"] = userdata.get("GOOGLE_API_KEY") or ""
@@ -1086,21 +1114,22 @@ class AsistenteHistologiaNeo4j:
             model="gemini-2.5-flash",
             google_api_key=userdata.get("GOOGLE_API_KEY"),
             temperature=0, max_output_tokens=None,
+            max_retries=1
         )
         print("✅ Gemini inicializado")
         
         # Inicializar Embeddings (Gemini)
         self.embeddings = GoogleGenerativeAIEmbeddings(
-            model="models/embedding-001",
+            model="models/gemini-embedding-001",
             google_api_key=userdata.get("GOOGLE_API_KEY"),
+            max_retries=1
         )
         print("✅ Embeddings Gemini inicializados")
 
-        # Cargar Modelos (CONCH + UNI)
-        self.conch = ConchWrapper(self.device)
-        if CONCH_AVAILABLE:
-            self.conch.load()
-            
+        # Cargar Modelos (UNI + PLIP)
+        self.plip = PlipWrapper(self.device)
+        self.plip.load()
+        
         self.uni = UniWrapper(self.device)
         self.uni.load()
 
@@ -1170,9 +1199,7 @@ class AsistenteHistologiaNeo4j:
         state["estructura_identificada"]     = None
         state["texto_embedding"]             = None
         state["similitud_semantica_dominio"] = 0.0
-        if not state.get("trayectoria"):
-            state["trayectoria"] = []
-        state["trayectoria"].append({"nodo": "Inicializar", "tiempo": 0})
+        state["trayectoria"] = [{"nodo": "Inicializar", "tiempo": 0}]
         return state
 
     async def _nodo_procesar_imagen(self, state: AgentState) -> AgentState:
@@ -1206,11 +1233,12 @@ class AsistenteHistologiaNeo4j:
 
         if imagen_path_activo and os.path.exists(imagen_path_activo):
             try:
-                emb_c = self.conch.embed_image(imagen_path_activo)
+                # emb_c removed
                 emb_u = self.uni.embed_image(imagen_path_activo)
+                emb_p = self.plip.embed_image(imagen_path_activo)
                 
-                state["imagen_embedding_conch"] = emb_c.tolist()
                 state["imagen_embedding_uni"]   = emb_u.tolist()
+                state["imagen_embedding_plip"]  = emb_p.tolist()
                 
                 state["tiene_imagen"]     = True
                 state["imagen_es_nueva"]  = imagen_es_nueva
@@ -1227,8 +1255,8 @@ class AsistenteHistologiaNeo4j:
             except Exception as e:
                 print(f"❌ Error imagen: {e}")
                 import traceback; traceback.print_exc()
-                state["imagen_embedding_conch"] = None
                 state["imagen_embedding_uni"]   = None
+                state["imagen_embedding_plip"]  = None
                 state["analisis_visual"]  = None
                 state["tiene_imagen"]     = False
         else:
@@ -1265,7 +1293,7 @@ class AsistenteHistologiaNeo4j:
                 )},
                 {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{data}"}}
             ])
-            resp = await self.llm.ainvoke([msg])
+            resp = await invoke_con_reintento(self.llm, [msg])
             return resp.content
         except Exception as e:
             print(f"⚠️ Error describiendo imagen: {e}")
@@ -1295,7 +1323,7 @@ class AsistenteHistologiaNeo4j:
             partes.append(f"CONTEXTO:\n{contexto_mem[:300]}")
 
         try:
-            resp = await self.llm.ainvoke([
+            resp = await invoke_con_reintento(self.llm, [
                 SystemMessage(content=system),
                 HumanMessage(content="\n\n".join(partes))
             ])
@@ -1377,7 +1405,7 @@ class AsistenteHistologiaNeo4j:
             + ("CONSULTA_VISUAL: <visual>" if state.get("tiene_imagen") else "")
         )
         try:
-            resp = await self.llm.ainvoke([
+            resp = await invoke_con_reintento(self.llm, [
                 SystemMessage(content=system),
                 HumanMessage(content=(
                     f"TÉRMINOS:\n{_safe(state.get('terminos_busqueda'))}"
@@ -1413,8 +1441,8 @@ class AsistenteHistologiaNeo4j:
 
         resultados = await self.neo4j.busqueda_hibrida(
             texto_embedding        = state.get("texto_embedding"),
-            imagen_embedding_conch = state.get("imagen_embedding_conch"),
             imagen_embedding_uni   = state.get("imagen_embedding_uni"),
+            imagen_embedding_plip  = state.get("imagen_embedding_plip"),
             entidades              = state.get("entidades_consulta", {}),
             top_k                  = 10
         )
@@ -1551,7 +1579,7 @@ class AsistenteHistologiaNeo4j:
         )})
 
         try:
-            resp = await self.llm.ainvoke([HumanMessage(content=content_parts)])
+            resp = await invoke_con_reintento(self.llm, [HumanMessage(content=content_parts)])
             state["analisis_comparativo"] = resp.content
             state["estructura_identificada"] = await self._extraer_estructura(resp.content)
             print(f"✅ Análisis comparativo: {len(resp.content)} chars")
@@ -1570,7 +1598,7 @@ class AsistenteHistologiaNeo4j:
 
     async def _extraer_estructura(self, analisis: str) -> Optional[str]:
         try:
-            resp = await self.llm.ainvoke([
+            resp = await invoke_con_reintento(self.llm, [
                 SystemMessage(content=(
                     "Extrae el nombre de la estructura histológica más probable. Solo el nombre."
                 )),
@@ -1688,7 +1716,7 @@ class AsistenteHistologiaNeo4j:
         print(f"   📊 {1 if state.get('tiene_imagen') else 0} usuario + {imagenes_usadas} manual")
 
         try:
-            resp = await self.llm.ainvoke([
+            resp = await invoke_con_reintento(self.llm, [
                 SystemMessage(content=system_prompt),
                 HumanMessage(content=content_parts)
             ])
@@ -1770,7 +1798,22 @@ class AsistenteHistologiaNeo4j:
                   f"{len(self.extractor_temario.temas)} temas")
 
     async def indexar_en_neo4j(self, directorio_pdfs: str = DIRECTORIO_PDFS,
-                                 imagen_files_extra: Optional[List[str]] = None):
+                                 imagen_files_extra: Optional[List[str]] = None,
+                                 forzar: bool = False):
+        # ── Verificar si ya hay datos ────────────────────────────────
+        if not forzar:
+            try:
+                res_chunks = await self.neo4j.run("MATCH (c:Chunk) RETURN count(c) AS n")
+                res_imgs   = await self.neo4j.run("MATCH (i:Imagen) RETURN count(i) AS n")
+                n_chunks = res_chunks[0]["n"] if res_chunks else 0
+                n_imgs   = res_imgs[0]["n"]   if res_imgs   else 0
+                if n_chunks > 0 and n_imgs > 0:
+                    print(f"✅ Base de datos Neo4j ya poblada ({n_chunks} chunks, {n_imgs} imágenes). Saltando indexación.")
+                    print("   (Usá --reindex --force para forzar re-indexación)")
+                    return
+            except Exception as e:
+                print(f"⚠️ No se pudo verificar estado de la BD: {e}")
+
         print("📄 Indexando chunks de texto en Neo4j...")
         for pdf_path in glob.glob(os.path.join(directorio_pdfs, "*.pdf")):
             fuente = os.path.basename(pdf_path)
@@ -1797,17 +1840,17 @@ class AsistenteHistologiaNeo4j:
             if not os.path.exists(img_path):
                 continue
             try:
-                emb_c  = self.conch.embed_image(img_path)
                 emb_u  = self.uni.embed_image(img_path)
+                emb_p  = self.plip.embed_image(img_path)
                 
                 img_id = f"img_{img_info['fuente_pdf']}_{img_info['pagina']}"
                 
                 await self.neo4j.upsert_imagen(
                     imagen_id=img_id, path=img_path,
-                    fuente=img_info["source_pdf"], pagina=img_info["page"],
+                    fuente=img_info["fuente_pdf"], pagina=img_info["pagina"],
                     ocr_text=img_info.get("ocr_text", ""),
-                    emb_conch=emb_c.tolist(),
-                    emb_uni=emb_u.tolist()
+                    emb_uni=emb_u.tolist(),
+                    emb_plip=emb_p.tolist()
                 )
             except Exception as e:
                 print(f"  ⚠️ Imagen {img_path}: {e}")
@@ -1816,16 +1859,18 @@ class AsistenteHistologiaNeo4j:
             if not os.path.exists(img_path):
                 continue
             try:
-                emb = self._embed_imagen(img_path)
+
                 ocr = ""
                 try:
                     ocr = pytesseract.image_to_string(Image.open(img_path)).strip()
                 except Exception:
                     pass
                 img_id = f"img_extra_{os.path.basename(img_path)}"
+                emb_u = self.uni.embed_image(img_path)
+                emb_p = self.plip.embed_image(img_path)
                 await self.neo4j.upsert_imagen(
                     imagen_id=img_id, path=img_path, fuente=os.path.basename(img_path),
-                    pagina=0, ocr_text=ocr[:300], embedding=emb.tolist()
+                    pagina=0, ocr_text=ocr[:300], emb_uni=emb_u.tolist(), emb_plip=emb_p.tolist()
                 )
             except Exception as e:
                 print(f"  ❌ Imagen extra {img_path}: {e}")
@@ -1857,7 +1902,7 @@ class AsistenteHistologiaNeo4j:
         initial_state = AgentState(
             messages=[], consulta_texto=consulta_texto,
             imagen_path=imagen_path,
-            imagen_embedding_conch=None, imagen_embedding_uni=None, texto_embedding=None, contexto_memoria="",
+            imagen_embedding_uni=None, imagen_embedding_plip=None, texto_embedding=None, contexto_memoria="",
             contenido_base=self.contenido_base, terminos_busqueda="",
             entidades_consulta={"tejidos": [], "estructuras": [], "tinciones": []},
             consulta_busqueda_texto="", consulta_busqueda_visual="",
@@ -1902,7 +1947,7 @@ class AsistenteHistologiaNeo4j:
 # MODO INTERACTIVO MEJORADO v4.1
 # =============================================================================
 
-async def modo_interactivo(reindex: bool = False):
+async def modo_interactivo(reindex: bool = False, force: bool = False):
     asistente = AsistenteHistologiaNeo4j()
     await asistente.inicializar_componentes()
 
@@ -1915,7 +1960,7 @@ async def modo_interactivo(reindex: bool = False):
 
     print("\n💾 Indexando en Neo4j...")
     if reindex:
-        await asistente.indexar_en_neo4j(DIRECTORIO_PDFS)
+        await asistente.indexar_en_neo4j(DIRECTORIO_PDFS, forzar=force)
     else:
         print("   (Saltando indexación — usar --reindex para forzar)")
 
@@ -2003,7 +2048,8 @@ async def modo_interactivo(reindex: bool = False):
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser()
-    parser.add_argument("--reindex", action="store_true", help="Forzar reindexación")
+    parser.add_argument("--reindex", action="store_true", help="Indexar en Neo4j (salta si ya hay datos)")
+    parser.add_argument("--force", action="store_true", help="Forzar re-indexación aunque haya datos")
     args = parser.parse_args()
 
     import logging
@@ -2011,4 +2057,4 @@ if __name__ == "__main__":
     print(f"✅ GPU: {torch.cuda.get_device_name()}" if torch.cuda.is_available() else "⚠️ CPU mode")
     os.makedirs("logs", exist_ok=True)
     os.makedirs(DIRECTORIO_IMAGENES, exist_ok=True)
-    asyncio.run(modo_interactivo(reindex=args.reindex))
+    asyncio.run(modo_interactivo(reindex=args.reindex, force=args.force))
