@@ -55,7 +55,7 @@ else:
 from neo4j import AsyncGraphDatabase, AsyncDriver
 from neo4j.exceptions import ServiceUnavailable
 
-from PyPDF2 import PdfReader
+import fitz # PyMuPDF
 from pdf2image import convert_from_path
 import pytesseract
 
@@ -127,33 +127,69 @@ ANCLAS_SEMANTICAS_HISTOLOGIA = [
 def _safe(value, default: str = "") -> str:
     return value if isinstance(value, str) and value else default
 
-async def invoke_con_reintento(llm, messages, max_retries=3):
+async def invoke_con_reintento(llm, messages, max_retries=5):
     import asyncio
     for attempt in range(max_retries):
         try:
             return await llm.ainvoke(messages)
         except Exception as e:
             err_str = str(e)
-            if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str:
+            if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str or "503" in err_str:
                 if attempt < max_retries - 1:
-                    print(f"   ⚠️ Límite de cuota API (429) - reintentando en 15s... (Intento {attempt+1}/{max_retries})")
-                    await asyncio.sleep(15)
+                    espera = 15 * (attempt + 1)
+                    print(f"   ⚠️ Límite de cuota API/Servidor Ocupado (429/503) - reintentando en {espera}s... (Intento {attempt+1}/{max_retries})")
+                    await asyncio.sleep(espera)
                 else:
                     raise e
             else:
                 raise e
 
-def invoke_con_reintento_sync(llm, messages, max_retries=3):
+def invoke_con_reintento_sync(llm, messages, max_retries=5):
     import time
     for attempt in range(max_retries):
         try:
             return llm.invoke(messages)
         except Exception as e:
             err_str = str(e)
-            if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str:
+            if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str or "503" in err_str:
                 if attempt < max_retries - 1:
-                    print(f"   ⚠️ Límite de cuota API (429) - reintentando en 15s... (Intento {attempt+1}/{max_retries})")
-                    time.sleep(15)
+                    espera = 15 * (attempt + 1)
+                    print(f"   ⚠️ Límite de cuota API/Servidor Ocupado (429/503) - reintentando en {espera}s... (Intento {attempt+1}/{max_retries})")
+                    time.sleep(espera)
+                else:
+                    raise e
+            else:
+                raise e
+
+def embed_query_con_reintento(embeddings, texto: str, max_retries=5):
+    import time
+    for attempt in range(max_retries):
+        try:
+            return embeddings.embed_query(texto)
+        except Exception as e:
+            err_str = str(e)
+            if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str or "503" in err_str:
+                if attempt < max_retries - 1:
+                    espera = 15 * (attempt + 1)
+                    print(f"   ⚠️ Límite de cuota API en embeddings (429/503) - reintentando en {espera}s... (Intento {attempt+1}/{max_retries})")
+                    time.sleep(espera)
+                else:
+                    raise e
+            else:
+                raise e
+
+def embed_documents_con_reintento(embeddings, textos: list, max_retries=5):
+    import time
+    for attempt in range(max_retries):
+        try:
+            return embeddings.embed_documents(textos)
+        except Exception as e:
+            err_str = str(e)
+            if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str or "503" in err_str:
+                if attempt < max_retries - 1:
+                    espera = 15 * (attempt + 1)
+                    print(f"   ⚠️ Límite de cuota API en embeddings (429/503) - reintentando en {espera}s... (Intento {attempt+1}/{max_retries})")
+                    time.sleep(espera)
                 else:
                     raise e
             else:
@@ -191,7 +227,7 @@ LANGSMITH_ENABLED, traceable, langsmith_client = setup_langsmith_environment()
 
 
 # =============================================================================
-# WRAPPERS DE MODELOS (CONCH & UNI)
+# WRAPPERS DE MODELOS (PLIP & UNI)
 # =============================================================================
 
 class PlipWrapper:
@@ -761,7 +797,7 @@ class ClasificadorSemantico:
         self._anclas_emb: Optional[np.ndarray] = None
 
     def _embed_textos(self, textos: List[str]) -> np.ndarray:
-        return np.array(self.embeddings.embed_documents(textos))
+        return np.array(embed_documents_con_reintento(self.embeddings, textos))
 
     def _get_anclas_emb(self) -> np.ndarray:
         if self._anclas_emb is None:
@@ -771,7 +807,7 @@ class ClasificadorSemantico:
 
     def similitud_con_dominio(self, consulta: str) -> float:
         try:
-            q_emb = np.array(self.embeddings.embed_query(consulta))
+            q_emb = np.array(embed_query_con_reintento(self.embeddings, consulta))
             a_emb = self._get_anclas_emb()
             sims  = (q_emb @ a_emb.T).flatten()
             return float(np.max(sims))
@@ -1760,7 +1796,7 @@ class AsistenteHistologiaNeo4j:
 
     def _embed_texto_gemini(self, texto: str) -> List[float]:
         # Usa langchain GoogleGenerativeAIEmbeddings
-        return self.embeddings.embed_query(texto)
+        return embed_query_con_reintento(self.embeddings, texto)
 
 
     # ------------------------------------------------------------------
@@ -1769,7 +1805,10 @@ class AsistenteHistologiaNeo4j:
 
     def _leer_pdf(self, path: str) -> str:
         try:
-            return "".join(p.extract_text() or "" for p in PdfReader(path).pages)
+            doc = fitz.open(path)
+            texto = "".join(page.get_text() for page in doc)
+            doc.close()
+            return texto
         except Exception as e:
             print(f"⚠️ Error leyendo {path}: {e}")
             return ""

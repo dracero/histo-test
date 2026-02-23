@@ -82,6 +82,9 @@ async def lifespan(app: FastAPI):
         n_temas = len(asistente.extractor_temario.temas) if asistente.extractor_temario else 0
         print(f"   → {n_temas} temas")
 
+        print("💾 Verificando e indexando base de datos Neo4j (si está vacía)...")
+        await asistente.indexar_en_neo4j(DIRECTORIO_PDFS, forzar=False)
+
         _init_complete = True
         print("✅ Servidor listo")
     except Exception as e:

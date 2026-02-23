@@ -27,7 +27,7 @@ graph TD
         N4J[("Neo4j Graph DB")]
         PDF["PDF Documents"]
         GEM["Gemini 1.5 Pro"]
-        EMB["CONCH / UNI Embeddings"]
+        EMB["PLIP / UNI Embeddings"]
     end
 
     %% Flujo
@@ -87,7 +87,7 @@ El servidor está construido con **FastAPI** y actúa como un wrapper alrededor 
 
 2.  **`ne4j-histo.py` (Core RAG)**:
     *   **LangGraph:** Orquestador del flujo de razonamiento (Planificar → Buscar → Refinar → Responder).
-    *   **Multimodal:** Integra modelos de visión (CONCH, UNI) para entender imágenes histológicas y buscar similares en la base de datos vectorial.
+    *   **Multimodal:** Integra modelos de visión (PLIP, UNI) para entender imágenes histológicas y buscar similares en la base de datos vectorial.
     *   **Neo4j:** Almacena el conocimiento en un grafo de conocimiento (Nodos: Texto, Imagen, Entidad).
 
 ---
