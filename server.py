@@ -175,21 +175,26 @@ async def post_chat(req: ChatRequest):
 
     imagen_path = None
     try:
-        # Si hay imagen, guardarla como archivo temporal
+        # Si hay imagen, guardarla en un directorio persistente
         if req.image_base64:
+            chat_img_dir = Path(__file__).parent / "imagenes_chat"
+            chat_img_dir.mkdir(exist_ok=True)
+            
             ext = ".png"
             if req.image_filename:
                 _, ext = os.path.splitext(req.image_filename)
                 if not ext:
                     ext = ".png"
-            tmp = tempfile.NamedTemporaryFile(
-                suffix=ext, prefix="histo_upload_", delete=False,
-                dir=tempfile.gettempdir()
-            )
-            tmp.write(base64.b64decode(req.image_base64))
-            tmp.close()
-            imagen_path = tmp.name
-            print(f"📷 Imagen guardada: {imagen_path}")
+            
+            # Nombre de archivo único
+            import uuid
+            nombre_archivo = f"upload_{uuid.uuid4().hex[:8]}{ext}"
+            imagen_path = str(chat_img_dir / nombre_archivo)
+            
+            with open(imagen_path, "wb") as f:
+                f.write(base64.b64decode(req.image_base64))
+                
+            print(f"📷 Imagen guardada para chat: {imagen_path}")
 
         # Ejecutar consulta RAG
         respuesta = await asistente.consultar(
@@ -229,12 +234,7 @@ async def post_chat(req: ChatRequest):
         traceback.print_exc()
         raise HTTPException(500, detail=str(e))
     finally:
-        # Limpiar archivo temporal (la imagen ya fue memorizada por el asistente)
-        if imagen_path and os.path.exists(imagen_path):
-            try:
-                os.unlink(imagen_path)
-            except Exception:
-                pass
+        pass
 
 
 

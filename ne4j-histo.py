@@ -59,12 +59,17 @@ import fitz # PyMuPDF
 from pdf2image import convert_from_path
 import pytesseract
 
-from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
+from langchain_google_genai import GoogleGenerativeAIEmbeddings
+from langchain_groq import ChatGroq
 from langchain_core.messages import HumanMessage, SystemMessage
 
 from langgraph.graph import StateGraph, START, END
 from langgraph.checkpoint.memory import MemorySaver
 import operator
+
+from qdrant_client import QdrantClient
+from qdrant_client.models import Distance, VectorParams, PointStruct
+import uuid
 
 # Wrapper para leer variables de entorno (compatible con .env)
 class userdata:
@@ -78,7 +83,7 @@ nest_asyncio.apply()
 # CONFIGURACIÓN GLOBAL
 # =============================================================================
 # CONFIGURACIÓN GLOBAL
-SIMILARITY_THRESHOLD  = 0.22
+SIMILARITY_THRESHOLD  = 0.50
 # Dimensiones de embeddings
 DIM_TEXTO_GEMINI = 3072
 DIM_IMG_UNI      = 1024
@@ -674,11 +679,11 @@ class Neo4jClient:
                     combined[key]["similitud"] += sim_ponderada
 
         # Pesos ajustados
-        agregar(res_texto, 0.45) # Texto sigue siendo fundamental
-        agregar(res_uni,   0.35) # UNI complemento visual
-        agregar(res_plip,  0.35) # PLIP complemento visual
-        agregar(res_ent,   0.25)
-        agregar(res_vec,   0.15)
+        agregar(res_texto, 0.40) # Texto sigue siendo fundamental
+        agregar(res_uni,   0.20) # UNI complemento visual
+        agregar(res_plip,  0.20) # PLIP complemento visual
+        agregar(res_ent,   0.35) # Entidades (¡Crucial para discriminar órganos!)
+        agregar(res_vec,   0.10)
 
         final = sorted(combined.values(), key=lambda x: x["similitud"], reverse=True)
 
@@ -697,10 +702,14 @@ class SemanticMemory:
     Mantiene historial de conversación y la última imagen activa.
     La imagen persiste entre turnos hasta que el usuario la cambie
     explícitamente con el comando 'nueva imagen'.
+    Añade persistencia en Qdrant con vectores texto, UNI y PLIP.
     """
 
-    def __init__(self, llm, max_entries: int = 10):
+    def __init__(self, llm, embeddings=None, uni=None, plip=None, max_entries: int = 10):
         self.llm            = llm
+        self.embeddings     = embeddings
+        self.uni            = uni
+        self.plip           = plip
         self.conversations  = []
         self.max_entries    = max_entries
         self.summary        = ""
@@ -710,6 +719,24 @@ class SemanticMemory:
         self.imagen_activa_path: Optional[str] = None
         self.imagen_turno_subida: int = 0
         self.turno_actual: int = 0
+        
+        # Qdrant init
+        self.collection_name = "memoria_histo"
+        self.qdrant = QdrantClient(path="./qdrant_memoria")
+        
+        # Si la colección no existe, se crea con vectores con nombre
+        try:
+            self.qdrant.get_collection(self.collection_name)
+        except Exception:
+            print(f"   🗂️ Creando colección Qdrant '{self.collection_name}' para memoria semántica...")
+            self.qdrant.create_collection(
+                collection_name=self.collection_name,
+                vectors_config={
+                    "texto": VectorParams(size=DIM_TEXTO_GEMINI, distance=Distance.COSINE),
+                    "uni": VectorParams(size=DIM_IMG_UNI, distance=Distance.COSINE),
+                    "plip": VectorParams(size=DIM_IMG_PLIP, distance=Distance.COSINE),
+                }
+            )
 
     def set_imagen(self, path: Optional[str]):
         """Registra una nueva imagen activa. None = limpiar."""
@@ -753,6 +780,54 @@ class SemanticMemory:
                     f"Asistente: {conv['response']}\n"
                 )
         self._update_summary()
+        
+        # Guardar en Qdrant cada 5 interacciones
+        if self.turno_actual % 5 == 0 and len(self.conversations) > 0 and self.embeddings:
+            self._guardar_memoria_qdrant()
+
+    def _guardar_memoria_qdrant(self):
+        print("   🧠 Generando resumen profundo para guardar en memoria (Qdrant)...")
+        try:
+            # Resumir contexto reciente
+            resp = invoke_con_reintento_sync(self.llm, [
+                SystemMessage(content="Genera un resumen detallado y técnico del siguiente historial de conversación sobre histología, destacando las entidades mencionadas y las conclusiones."),
+                HumanMessage(content=self.direct_history)
+            ])
+            resumen = resp.content
+            
+            # Embeddings del resumen textual
+            emb_texto = embed_query_con_reintento(self.embeddings, resumen)
+            
+            # Embeddings visuales de la imagen activa en este bloque (si la hay)
+            emb_uni = [0.0] * DIM_IMG_UNI
+            emb_plip = [0.0] * DIM_IMG_PLIP
+            if self.imagen_activa_path and os.path.exists(self.imagen_activa_path):
+                if self.uni:
+                    emb_uni = self.uni.embed_image(self.imagen_activa_path).tolist()
+                if self.plip:
+                    emb_plip = self.plip.embed_image(self.imagen_activa_path).tolist()
+
+            point = PointStruct(
+                id=str(uuid.uuid4()),
+                vector={
+                    "texto": emb_texto,
+                    "uni": emb_uni,
+                    "plip": emb_plip
+                },
+                payload={
+                    "resumen": resumen,
+                    "turno_fin": self.turno_actual,
+                    "tiene_imagen": self.imagen_activa_path is not None,
+                    "imagen_path": self.imagen_activa_path
+                }
+            )
+            self.qdrant.upsert(
+                collection_name=self.collection_name,
+                points=[point]
+            )
+            print("   ✅ Resumen guardado en Qdrant (memoria_histo)")
+        except Exception as e:
+            print(f"   ⚠️ Error guardando memoria en Qdrant: {e}")
 
     def _update_summary(self):
         try:
@@ -767,8 +842,26 @@ class SemanticMemory:
         except Exception as e:
             self.summary = f"Recientes:{self.direct_history}"
 
-    def get_context(self) -> str:
+    def get_context(self, query: str = "") -> str:
         ctx = self.summary.strip() or "No hay consultas previas."
+        
+        # Recuperar de Qdrant
+        if query and self.embeddings:
+            try:
+                emb_query = embed_query_con_reintento(self.embeddings, query)
+                resultados = self.qdrant.query_points(
+                    collection_name=self.collection_name,
+                    query=emb_query,
+                    using="texto",
+                    limit=2
+                ).points
+                
+                memorias_recuperadas = [r.payload['resumen'] for r in resultados if r.score > 0.4]
+                if memorias_recuperadas:
+                    ctx += "\n\n[Memorias históricas recuperadas:]\n" + "\n- ".join(memorias_recuperadas)
+            except Exception as e:
+                print(f"   ⚠️ Error recuperando memoria Qdrant: {e}")
+
         if self.imagen_activa_path:
             ctx += (f"\n\n[Imagen activa en el chat: "
                     f"{os.path.basename(self.imagen_activa_path)}]")
@@ -1070,6 +1163,7 @@ class AgentState(TypedDict):
     analisis_comparativo:        Optional[str]
     estructura_identificada:     Optional[str]
     similitud_semantica_dominio: float
+    confianza_baja:              bool
 
 
 # =============================================================================
@@ -1122,7 +1216,12 @@ class AsistenteHistologiaNeo4j:
 
     async def inicializar_componentes(self):
         self._init_modelos()
-        self.memoria             = SemanticMemory(llm=self.llm)
+        self.memoria             = SemanticMemory(
+            llm=self.llm,
+            embeddings=self.embeddings,
+            uni=self.uni,
+            plip=self.plip
+        )
         self.extractor_temario   = ExtractorTemario(llm=self.llm)
         self.extractor_entidades = ExtractorEntidades(llm=self.llm)
         self.clasificador_semantico = ClasificadorSemantico(
@@ -1146,13 +1245,12 @@ class AsistenteHistologiaNeo4j:
         print("✅ Todos los componentes inicializados")
 
     def _init_modelos(self):
-        self.llm = ChatGoogleGenerativeAI(
-            model="gemini-2.5-flash",
-            google_api_key=userdata.get("GOOGLE_API_KEY"),
-            temperature=0, max_output_tokens=None,
-            max_retries=1
+        self.llm = ChatGroq(
+            model="meta-llama/llama-4-scout-17b-16e-instruct",
+            api_key=userdata.get("GROQ_API_KEY"),
+            temperature=0, max_retries=1
         )
-        print("✅ Gemini inicializado")
+        print("✅ Groq inicializado")
         
         # Inicializar Embeddings (Gemini)
         self.embeddings = GoogleGenerativeAIEmbeddings(
@@ -1218,7 +1316,7 @@ class AsistenteHistologiaNeo4j:
 
     async def _nodo_inicializar(self, state: AgentState) -> AgentState:
         print("📝 Inicializando flujo v4.1 (Neo4j)")
-        state["contexto_memoria"]            = self.memoria.get_context()
+        state["contexto_memoria"]            = self.memoria.get_context(state.get("consulta_texto", ""))
         state["contenido_base"]              = self.contenido_base
         state["tiempo_inicio"]               = time.time()
         state["tiene_imagen"]                = False
@@ -1606,12 +1704,12 @@ class AsistenteHistologiaNeo4j:
 
         features_lista = "\n".join(f"  - {f}" for f in FEATURES_DISCRIMINATORIAS)
         content_parts.append({"type": "text", "text": (
-            "\n=== INSTRUCCIONES ===\n"
-            f"Compara en estas features:\n{features_lista}\n\n"
+            "\n=== INSTRUCCIONES ESTRICTAS ===\n"
+            f"Compara rigurosamente basándote en:\n{features_lista}\n\n"
+            "TU ROL ES SER UN JUEZ ESCÉPTICO. Tu objetivo principal es encontrar las DIFERENCIAS que demuestren que NO son el mismo tejido.\n\n"
             "1. TABLA COMPARATIVA (Markdown): | Feature | Consulta | Ref#1 | Ref#2 |\n"
-            "2. VEREDICTO POR REFERENCIA: ¿misma estructura? Features que coinciden/difieren.\n"
-            "3. CONCLUSIÓN: estructura más probable, ¿confundible con cuerpo de albicans?, "
-            "confianza diagnóstica."
+            "2. VEREDICTO DE IDENTIDAD: Si la imagen de consulta parece ser un órgano distinto al de las referencias, DEBES declarar EXPLÍCITAMENTE que son TEJIDOS DIFERENTES, sin importar su parecido visual por la tinción.\n"
+            "3. CONCLUSIÓN FINAL: ¿Son la misma estructura biológica? (SÍ/NO). Si es NO, indica qué crees que es realmente la imagen de la consulta."
         )})
 
         try:
@@ -1648,27 +1746,23 @@ class AsistenteHistologiaNeo4j:
         t0 = time.time()
         print("💭 Generando respuesta v4.1...")
 
+        aviso_db = ""
         if not state["contexto_suficiente"]:
-            # Sin contexto RAG pero hay imagen → respuesta visual directa
+            # Sin contexto RAG pero hay imagen → permitimos que el LLM responda guiándose por la imagen y la memoria
             if state.get("tiene_imagen") and state.get("imagen_path"):
-                print("   ⚠️ Sin contexto RAG pero hay imagen — respuesta visual directa")
-                analisis_visual_str = _safe(state.get("analisis_visual"), "No disponible")
-                state["respuesta_final"] = (
-                    "⚠️ *No encontré fragmentos relevantes en el manual*, "
-                    "pero puedo ofrecerte el análisis visual de la imagen:\n\n"
-                    f"{analisis_visual_str}"
-                )
+                print("   ⚠️ Sin contexto RAG pero hay imagen — permitiendo chat con imagen")
+                aviso_db = "\n\nAVISO PARA EL ASISTENTE: No se encontraron resultados en la base de datos para esta consulta. DEBES informar explícitamente al usuario que no encontraste información referenciada en el manual, pero responde a su pregunta basándote en la imagen subida y el historial de chat."
                 state["contexto_suficiente"] = True
             else:
                 state["respuesta_final"] = (
                     f"❌ Sin información suficiente (umbral {self.SIMILARITY_THRESHOLD:.0%}).\n"
                     f"Consulta: {state['consulta_busqueda_texto']}"
                 )
-            state["trayectoria"].append({
-                "nodo": "GenerarRespuesta", "contexto_suficiente": False,
-                "tiempo": round(time.time()-t0, 2)
-            })
-            return state
+                state["trayectoria"].append({
+                    "nodo": "GenerarRespuesta", "contexto_suficiente": False,
+                    "tiempo": round(time.time()-t0, 2)
+                })
+                return state
 
         tiene_comparativo = bool(_safe(state.get("analisis_comparativo")))
         nota_comp = (
@@ -1677,17 +1771,17 @@ class AsistenteHistologiaNeo4j:
         )
 
         system_prompt = (
-            "Eres un asistente de histología. Responde SOLO con el contenido del manual.\n\n"
+            "Eres un asistente de histología. Responde SOLO con el contenido del manual o la imagen visible en el chat.\n\n"
             "REGLAS:\n"
-            "1. Solo información de SECCIONES DEL MANUAL e IMÁGENES DE REFERENCIA.\n"
+            "1. Solo información de SECCIONES DEL MANUAL e IMÁGENES DE REFERENCIA guardadas en la base de datos, o la propia imagen que subió el usuario.\n"
             "2. Cita: [Manual: archivo] | [Imagen: archivo]\n"
-            "3. No diagnósticos clínicos salvo que el manual los mencione.\n\n"
+            "3. No diagnósticos clínicos salvo que estén explícitos.\n\n"
             "ESTRUCTURA:\n"
-            "1. Descripción de la imagen del usuario (si aplica)\n"
-            "2. Características histológicas según el manual\n"
-            "3. Análisis comparativo (si aplica)\n"
-            "4. Diagnóstico diferencial con diferencias morfológicas clave\n"
-            f"5. Conclusión y confianza{nota_comp}"
+            "1. Análisis de la consulta basado en la imagen del usuario (si la hay)\n"
+            "2. VALIDACIÓN: Revisa el 'ANÁLISIS COMPARATIVO'. Si concluye que la imagen del usuario NO ES LA MISMA ESTRUCTURA que las imágenes de referencia del manual, debes informar al usuario: 'Tu imagen parece ser X, pero el manual solo contiene información sobre Y, por lo que no puedo ayudarte con el manual.' y DETENTE AHÍ.\n"
+            "3. Características histológicas según la base de datos (SOLO si las estructuras coinciden)\n"
+            "4. Conclusión y confianza"
+            f"{nota_comp}{aviso_db}"
         )
 
         analisis_comp_str   = _safe(state.get("analisis_comparativo"))
@@ -1756,7 +1850,14 @@ class AsistenteHistologiaNeo4j:
                 SystemMessage(content=system_prompt),
                 HumanMessage(content=content_parts)
             ])
-            state["respuesta_final"] = resp.content
+            if state.get("confianza_baja"):
+                warning = "⚠️ *Nota: Esta respuesta se generó con confianza baja (<71% de coincidencia) en los apuntes, tómalo en cuenta.*"
+                if "Hola, ¿en qué te puedo ayudar sobre histología?" in resp.content:
+                    state["respuesta_final"] = resp.content
+                else:
+                    state["respuesta_final"] = f"{warning}\n\n{resp.content}"
+            else:
+                state["respuesta_final"] = resp.content
             print(f"✅ Respuesta: {len(resp.content)} chars")
         except Exception as e:
             print(f"❌ Error: {e}")
@@ -1940,7 +2041,7 @@ class AsistenteHistologiaNeo4j:
 
         initial_state = AgentState(
             messages=[], consulta_texto=consulta_texto,
-            imagen_path=imagen_path,
+            imagen_path=imagen_activa,
             imagen_embedding_uni=None, imagen_embedding_plip=None, texto_embedding=None, contexto_memoria="",
             contenido_base=self.contenido_base, terminos_busqueda="",
             entidades_consulta={"tejidos": [], "estructuras": [], "tinciones": []},
@@ -1951,7 +2052,7 @@ class AsistenteHistologiaNeo4j:
             contexto_suficiente=False, temario=self.extractor_temario.temas,
             tema_valido=True, tema_encontrado=None, imagenes_recuperadas=[],
             analisis_comparativo=None, estructura_identificada=None,
-            similitud_semantica_dominio=0.0,
+            similitud_semantica_dominio=0.0, confianza_baja=False,
         )
 
         config = {
