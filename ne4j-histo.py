@@ -2686,15 +2686,9 @@ class AsistenteHistologiaNeo4j:
         
         state["imagenes_para_mostrar"] = imgs_para_mostrar
         if imgs_para_mostrar:
-            print(f"   ✅ {len(imgs_para_mostrar)} imágenes extraídas para mostrar")
-            # Marcar que hay imágenes disponibles para mostrar
-            state["mostrar_imagenes"] = True
-            # Asegurar que hay contexto suficiente si encontramos imágenes
-            if not state.get("contexto_suficiente"):
-                state["contexto_suficiente"] = True
+            print(f"   ✅ {len(imgs_para_mostrar)} imágenes extraídas (disponibles si el usuario las pidió)")
         else:
             print("   ℹ️ No se encontraron imágenes en los resultados recuperados")
-            state["mostrar_imagenes"] = False
         
         # ELIMINADO: Búsqueda adicional redundante
         # imgs_para_mostrar = await self.neo4j.busqueda_imagenes_semantica(
@@ -3186,10 +3180,10 @@ class AsistenteHistologiaNeo4j:
 
     async def _nodo_finalizar(self, state: AgentState) -> AgentState:
         # ── Post-procesamiento: extraer imágenes referenciadas en la respuesta ──
-        # El LLM menciona imágenes como "Imagen 15.1", "Fig 3A", etc.
-        # Buscamos esos nodos :Imagen por etiqueta en Neo4j y las mostramos al usuario.
+        # Solo buscar imágenes si el usuario las pidió explícitamente
         respuesta = state.get("respuesta_final", "")
-        if respuesta and self.neo4j:
+        usuario_pidio_imagenes = state.get("mostrar_imagenes", False)
+        if respuesta and self.neo4j and usuario_pidio_imagenes:
             import re
             # Capturar múltiples formatos de referencia a imágenes:
             # "Imagen 15.1", "Imagen 15.1:", "imagen 3.2", "Fig 3A", "Figura 5.1"
@@ -3209,7 +3203,13 @@ class AsistenteHistologiaNeo4j:
                         patrones.append(f"Fig {e}")
                         patrones.append(f"Figura {e}")
                         patrones.append(e)  # solo el número "15.1"
-                    print(f"   🔍 DEBUG: Buscando patrones: {patrones[:6]}...")
+                        # Variante con espacio antes del decimal (ej: "13. 4" en vez de "13.4")
+                        if '.' in e:
+                            parts = e.split('.', 1)
+                            spaced = f"{parts[0]}. {parts[1]}"
+                            patrones.append(f"Imagen {spaced}")
+                            patrones.append(spaced)
+                    print(f"   🔍 DEBUG: Buscando patrones: {patrones[:8]}...")
                     query = """
                         MATCH (i:Imagen)
                         WHERE i.path IS NOT NULL
@@ -3262,7 +3262,33 @@ class AsistenteHistologiaNeo4j:
                         else:
                             print("   ⚠️ Imágenes referenciadas no encontradas en disco")
                     else:
+                        # Diagnóstico: buscar qué etiquetas existen en Neo4j
                         print("   ⚠️ No se encontraron nodos :Imagen para las etiquetas mencionadas")
+                        try:
+                            debug_q = await self.neo4j.run(
+                                "MATCH (i:Imagen) WHERE i.etiqueta IS NOT NULL AND i.etiqueta <> '' "
+                                "RETURN i.etiqueta AS etiqueta, i.nombre_archivo AS archivo, i.path AS path "
+                                "LIMIT 20"
+                            )
+                            if debug_q:
+                                print(f"   🔍 DEBUG: Etiquetas existentes en Neo4j ({len(debug_q)}):")
+                                for d in debug_q[:10]:
+                                    print(f"      → etiqueta='{d.get('etiqueta')}' | archivo='{d.get('archivo')}' | path='{d.get('path')}'")
+                            else:
+                                # Si no hay etiquetas, buscar por caption
+                                debug_c = await self.neo4j.run(
+                                    "MATCH (i:Imagen) WHERE i.caption IS NOT NULL AND i.caption <> '' "
+                                    "RETURN i.caption AS caption, i.nombre_archivo AS archivo, i.path AS path "
+                                    "LIMIT 10"
+                                )
+                                if debug_c:
+                                    print(f"   🔍 DEBUG: No hay etiquetas, pero hay captions ({len(debug_c)}):")
+                                    for d in debug_c[:5]:
+                                        print(f"      → caption='{d.get('caption', '')[:80]}' | archivo='{d.get('archivo')}'")
+                                else:
+                                    print("   🔍 DEBUG: No hay etiquetas ni captions en nodos :Imagen")
+                        except Exception as de:
+                            print(f"   🔍 DEBUG error: {de}")
                 except Exception as e:
                     print(f"   ⚠️ Error buscando imágenes por referencia: {e}")
 
