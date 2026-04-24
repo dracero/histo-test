@@ -706,27 +706,32 @@ class Neo4jClient:
             UNWIND $ids AS nid
             MATCH (n {id: nid})
 
-            // Expansión 1: otros nodos en el mismo PDF (excluir el nodo origen)
+            // Expansión 1a: chunks de texto del mismo PDF (excluir imágenes y nodo origen)
             OPTIONAL MATCH (n)-[:PERTENECE_A]->(pdf:PDF)<-[:PERTENECE_A]-(vecino_pdf)
-            WHERE vecino_pdf.id <> nid
-            WITH n, nid, collect(DISTINCT vecino_pdf)[..5] AS list_pdf
+            WHERE vecino_pdf.id <> nid AND NOT vecino_pdf:Imagen
+            WITH n, nid, collect(DISTINCT vecino_pdf)[..3] AS list_pdf_chunks
+
+            // Expansión 1b: imágenes del mismo PDF (separadas para garantizar inclusión)
+            OPTIONAL MATCH (n)-[:PERTENECE_A]->(pdf2:PDF)<-[:PERTENECE_A]-(img_pdf:Imagen)
+            WHERE img_pdf.id <> nid
+            WITH n, nid, list_pdf_chunks, collect(DISTINCT img_pdf)[..5] AS list_pdf_images
 
             // Expansión 2: chunks que comparten entidades (excluir el nodo origen)
             OPTIONAL MATCH (n)-[:MENCIONA]->(entidad)<-[:MENCIONA]-(vecino_entidad:Chunk)
             WHERE vecino_entidad.id <> nid
-            WITH n, nid, list_pdf, collect(DISTINCT vecino_entidad)[..5] AS list_ent
+            WITH n, nid, list_pdf_chunks, list_pdf_images, collect(DISTINCT vecino_entidad)[..5] AS list_ent
 
             // Expansión 3: imágenes similares por embedding
             OPTIONAL MATCH (n)-[:SIMILAR_A]-(vecino_similar:Imagen)
-            WITH n, nid, list_pdf, list_ent, collect(DISTINCT vecino_similar)[..5] AS list_sim
+            WITH n, nid, list_pdf_chunks, list_pdf_images, list_ent, collect(DISTINCT vecino_similar)[..5] AS list_sim
 
             // Expansión 4: imágenes de la misma página (Fix #4)
             OPTIONAL MATCH (n)-[:EN_PAGINA]->(pag:Pagina)<-[:EN_PAGINA]-(img_pag:Imagen)
             WHERE img_pag.id <> nid
-            WITH n, nid, list_pdf, list_ent, list_sim, collect(DISTINCT img_pag)[..5] AS list_pag
+            WITH n, nid, list_pdf_chunks, list_pdf_images, list_ent, list_sim, collect(DISTINCT img_pag)[..5] AS list_pag
 
             WITH n, $ids AS ids_originales,
-                 list_pdf + list_ent + list_sim + list_pag AS vecinos_raw
+                 list_pdf_chunks + list_pdf_images + list_ent + list_sim + list_pag AS vecinos_raw
 
             UNWIND vecinos_raw AS v
 
@@ -755,7 +760,8 @@ class Neo4jClient:
                     ELSE 0.3 
                 END AS similitud,
                 CASE WHEN v:Imagen THEN coalesce(v.nombre_archivo, '') ELSE '' END AS nombre_archivo,
-                CASE WHEN v:Imagen THEN coalesce(v.etiqueta, '') ELSE '' END AS etiqueta
+                CASE WHEN v:Imagen THEN coalesce(v.etiqueta, '') ELSE '' END AS etiqueta,
+                'vecindad' AS origen
             LIMIT 15
         """
         try:
@@ -998,6 +1004,97 @@ class Neo4jClient:
         
         return filtrados[:top_k]
 
+    def extraer_imagenes_de_resultados(self, resultados: List[Dict], top_k: int = 5) -> List[Dict]:
+        """
+        Extrae y valida imágenes desde resultados de búsqueda híbrida.
+        
+        Esta función filtra resultados de tipo "imagen", valida su integridad
+        (path existe en disco, propiedades completas), transforma el formato
+        (renombra propiedades), y limita a top-K resultados.
+        
+        Args:
+            resultados: Lista de resultados de expandir_vecindad() o busqueda_hibrida()
+            top_k: Número máximo de imágenes a retornar (default 5)
+        
+        Returns:
+            Lista de diccionarios con formato:
+            {
+                "id": str,
+                "path": str,
+                "caption": str,
+                "nombre_archivo": str,
+                "etiqueta": str,
+                "fuente": str,
+                "similitud_semantica": float
+            }
+        """
+        # Logging inicial
+        print(f"   📋 Total de resultados: {len(resultados)}")
+        
+        # Paso 1: Filtrar solo imágenes
+        imagenes = [r for r in resultados if r.get("tipo") == "imagen"]
+        print(f"   🖼️ Resultados de tipo imagen: {len(imagenes)}")
+        
+        if not imagenes:
+            print("   ⚠️ No hay imágenes en los resultados de búsqueda")
+            return []
+        
+        # Paso 2: Validar integridad y transformar formato
+        imagenes_validas = []
+        
+        for img in imagenes:
+            # Validar path (puede estar como 'imagen_path' o 'path')
+            img_path = img.get("imagen_path") or img.get("path")
+            if not img_path:
+                print(f"   ⚠️ Imagen {img.get('id')} sin path, omitida")
+                continue
+            
+            # Validar existencia en disco
+            if not os.path.exists(img_path):
+                print(f"   ⚠️ Archivo no existe: {img_path}")
+                continue
+            
+            # Validar/asignar nombre_archivo
+            nombre_archivo = img.get("nombre_archivo", "")
+            if not nombre_archivo:
+                nombre_archivo = os.path.basename(img_path)
+            
+            # Transformar formato
+            imagen_transformada = {
+                "id": img.get("id", ""),
+                "path": img_path,
+                "caption": img.get("texto", ""),  # Renombrar texto → caption
+                "nombre_archivo": nombre_archivo,
+                "etiqueta": img.get("etiqueta", ""),
+                "fuente": img.get("fuente", ""),
+                "similitud_semantica": img.get("similitud", 0.0),  # Renombrar similitud → similitud_semantica
+            }
+            
+            # Validar propiedades requeridas
+            propiedades_requeridas = [
+                "id", "path", "caption", "nombre_archivo", 
+                "etiqueta", "fuente", "similitud_semantica"
+            ]
+            
+            if all(prop in imagen_transformada for prop in propiedades_requeridas):
+                imagenes_validas.append(imagen_transformada)
+            else:
+                faltantes = [p for p in propiedades_requeridas if p not in imagen_transformada]
+                print(f"   ⚠️ Imagen {img.get('id')} con propiedades faltantes: {faltantes}")
+        
+        print(f"   ✅ Imágenes válidas: {len(imagenes_validas)}")
+        
+        # Paso 3: Limitar a top-K
+        imagenes_finales = imagenes_validas[:top_k]
+        
+        # Logging de resultados finales
+        if imagenes_finales:
+            print(f"   📷 Top-{len(imagenes_finales)} imágenes:")
+            for img in imagenes_finales[:3]:
+                print(f"      {img['nombre_archivo']} | sim={img['similitud_semantica']:.3f} | {img['fuente']}")
+        
+        return imagenes_finales
+
     async def busqueda_hibrida(self,
                                 texto_embedding: Optional[List[float]],
                                 imagen_embedding_uni: Optional[List[float]],
@@ -1096,7 +1193,30 @@ class Neo4jClient:
             agregar(res_ent,   0.60)  # Entidades siempre importantes
         agregar(res_vec,   0.20)
 
+        # Debug: mostrar imágenes en res_vec antes del sort
+        imgs_en_vec = [r for r in res_vec if r.get("tipo") == "imagen"]
+        if imgs_en_vec:
+            print(f"   🔍 DEBUG: {len(imgs_en_vec)} imágenes en res_vec (vecindad)")
+            for img in imgs_en_vec[:3]:
+                key = img.get("id") or f"{img.get('fuente')}_{str(img.get('texto',''))[:40]}"
+                sim_en_combined = combined.get(key, {}).get("similitud", 0)
+                print(f"      → {img.get('nombre_archivo', 'N/A')} | sim_original={img.get('similitud', 0):.3f} | sim_ponderada={sim_en_combined:.3f}")
+        else:
+            print(f"   🔍 DEBUG: 0 imágenes en res_vec (vecindad) — {len(res_vec)} resultados totales")
+
+        # Garantizar que imágenes de vecindad entren en el resultado final
+        # Las imágenes de vecindad son contextualmente relevantes (conectadas en el grafo)
+        # pero su similitud ponderada (0.3 * 0.20 = 0.06) es demasiado baja para competir
+        # con chunks de texto. Boost para asegurar inclusión.
+        for key, val in combined.items():
+            if val.get("tipo") == "imagen" and val.get("origen") == "vecindad":
+                val["similitud"] = max(val["similitud"], 0.50)  # Mínimo 0.50 para imágenes de vecindad
+
         final = sorted(combined.values(), key=lambda x: x["similitud"], reverse=True)
+
+        # Debug: mostrar imágenes en final
+        imgs_en_final = [r for r in final if r.get("tipo") == "imagen"]
+        print(f"   🔍 DEBUG: {len(imgs_en_final)} imágenes en resultado final (antes de [:15])")
 
         print(f"   📊 Híbrida: Txt={len(res_texto)} | "
               f"UNI={len(res_uni)} | PLIP={len(res_plip)} | Ent={len(res_ent)} | "
@@ -2552,28 +2672,42 @@ class AsistenteHistologiaNeo4j:
         state["resultados_busqueda"] = resultados
         print(f"✅ {len(resultados)} resultados")
 
-        # --- Búsqueda de imágenes para mostrar (cuando el usuario las pide) ---
-        if state.get("mostrar_imagenes", False):
-            print("   🖼️ Buscando imágenes de la BD para mostrar al usuario...")
-            imgs_para_mostrar = await self.neo4j.busqueda_imagenes_semantica(
-                texto_embedding=state.get("texto_embedding", []),
-                entidades=state.get("entidades_consulta", {}),
-                embeddings_model=self.embeddings,
-                top_k=3
-            )
-            state["imagenes_para_mostrar"] = imgs_para_mostrar
-            if imgs_para_mostrar:
-                print(f"   ✅ {len(imgs_para_mostrar)} imágenes encontradas para mostrar")
-                # Asegurar que hay contexto suficiente si encontramos imágenes
-                # (el usuario pidió ver imágenes y las encontramos)
-                if not state.get("contexto_suficiente"):
-                    state["contexto_suficiente"] = True
-            else:
-                print("   ⚠️ No se encontraron imágenes relevantes para mostrar")
+        # --- Extracción de imágenes para mostrar ---
+        # Siempre intentar extraer imágenes de los resultados recuperados
+        # (si hay imágenes en la vecindad del grafo, son relevantes al contexto)
+        print(f"   🔍 DEBUG: resultados_busqueda tiene {len(state['resultados_busqueda'])} elementos")
+        print(f"   🔍 DEBUG: Tipos en resultados: {[r.get('tipo') for r in state['resultados_busqueda']]}")
+        print("   🖼️ Extrayendo imágenes de los resultados recuperados...")
+        
+        imgs_para_mostrar = self.neo4j.extraer_imagenes_de_resultados(
+            resultados=state["resultados_busqueda"],
+            top_k=3
+        )
+        
+        state["imagenes_para_mostrar"] = imgs_para_mostrar
+        if imgs_para_mostrar:
+            print(f"   ✅ {len(imgs_para_mostrar)} imágenes extraídas para mostrar")
+            # Marcar que hay imágenes disponibles para mostrar
+            state["mostrar_imagenes"] = True
+            # Asegurar que hay contexto suficiente si encontramos imágenes
+            if not state.get("contexto_suficiente"):
+                state["contexto_suficiente"] = True
+        else:
+            print("   ℹ️ No se encontraron imágenes en los resultados recuperados")
+            state["mostrar_imagenes"] = False
+        
+        # ELIMINADO: Búsqueda adicional redundante
+        # imgs_para_mostrar = await self.neo4j.busqueda_imagenes_semantica(
+        #     texto_embedding=state.get("texto_embedding", []),
+        #     entidades=state.get("entidades_consulta", {}),
+        #     embeddings_model=self.embeddings,
+        #     top_k=3
+        # )
 
         state["trayectoria"].append({
             "nodo": "BuscarNeo4j", "hits": len(resultados),
             "imagenes_para_mostrar": len(state.get("imagenes_para_mostrar", [])),
+            "imagenes_extraidas_de_vecindad": True,  # Siempre se intenta extraer imágenes
             "tiempo": round(time.time()-t0, 2)
         })
         return state
@@ -2591,10 +2725,15 @@ class AsistenteHistologiaNeo4j:
             current_sim = r.get("similitud", 0)
             if r.get("tipo") == "texto" and current_sim < umbral_texto:
                 continue
-            if r.get("tipo") == "imagen" and current_sim < umbral_imagen:
-                continue
+            
+            # Filter images by threshold, UNLESS they come from graph expansion
+            if r.get("tipo") == "imagen":
+                es_vecindad = r.get("origen") == "vecindad"
+                if not es_vecindad and current_sim < umbral_imagen:
+                    continue
 
             # Si es imagen pero no existe el archivo en disco, lo rechazamos
+            # (applies to ALL images, regardless of origen)
             if r.get("tipo") == "imagen":
                 img_p = r.get("imagen_path")
                 if not img_p or not os.path.exists(img_p):
@@ -2997,22 +3136,26 @@ class AsistenteHistologiaNeo4j:
                 print(f"   ⚠️ No se pudo añadir imagen usuario: {e}")
 
         imagenes_usadas = 0
-        for img_path in state.get("imagenes_recuperadas", [])[:3]:
-            if not os.path.exists(img_path):
-                continue
-            try:
-                with open(img_path, "rb") as f:
-                    data = base64.b64encode(f.read()).decode("utf-8")
-                ext    = os.path.splitext(img_path)[1].lower()
-                mime   = "image/png" if ext == ".png" else "image/jpeg"
-                nombre = os.path.basename(img_path)
-                content_parts.append({"type": "text",
-                                       "text": f"\n**REFERENCIA [Imagen: {nombre}]:**"})
-                content_parts.append({"type": "image_url",
-                                       "image_url": {"url": f"data:{mime};base64,{data}"}})
-                imagenes_usadas += 1
-            except Exception as e:
-                print(f"   ⚠️ {img_path}: {e}")
+        # Solo enviar imágenes al LLM si el usuario subió una imagen (modo multimodal)
+        # En modo solo texto, el LLM referencia imágenes por etiqueta ("Imagen 15.1")
+        # desde el texto de los chunks, y _nodo_finalizar las busca en Neo4j
+        if not es_solo_texto:
+            for img_path in state.get("imagenes_recuperadas", [])[:3]:
+                if not os.path.exists(img_path):
+                    continue
+                try:
+                    with open(img_path, "rb") as f:
+                        data = base64.b64encode(f.read()).decode("utf-8")
+                    ext    = os.path.splitext(img_path)[1].lower()
+                    mime   = "image/png" if ext == ".png" else "image/jpeg"
+                    nombre = os.path.basename(img_path)
+                    content_parts.append({"type": "text",
+                                           "text": f"\n**REFERENCIA [Imagen: {nombre}]:**"})
+                    content_parts.append({"type": "image_url",
+                                           "image_url": {"url": f"data:{mime};base64,{data}"}})
+                    imagenes_usadas += 1
+                except Exception as e:
+                    print(f"   ⚠️ {img_path}: {e}")
 
         print(f"   📊 {1 if state.get('tiene_imagen') else 0} usuario + {imagenes_usadas} manual")
 
@@ -3042,6 +3185,87 @@ class AsistenteHistologiaNeo4j:
         return state
 
     async def _nodo_finalizar(self, state: AgentState) -> AgentState:
+        # ── Post-procesamiento: extraer imágenes referenciadas en la respuesta ──
+        # El LLM menciona imágenes como "Imagen 15.1", "Fig 3A", etc.
+        # Buscamos esos nodos :Imagen por etiqueta en Neo4j y las mostramos al usuario.
+        respuesta = state.get("respuesta_final", "")
+        if respuesta and self.neo4j:
+            import re
+            # Capturar múltiples formatos de referencia a imágenes:
+            # "Imagen 15.1", "Imagen 15.1:", "imagen 3.2", "Fig 3A", "Figura 5.1"
+            etiquetas_mencionadas = re.findall(
+                r'(?:[Ii]magen|[Ff]ig(?:ura)?)\s+(\d+(?:\.\d+)?[A-Za-z]?)', respuesta
+            )
+            print(f"   🔍 DEBUG finalizar: etiquetas encontradas en respuesta = {etiquetas_mencionadas}")
+            if etiquetas_mencionadas:
+                etiquetas_unicas = list(dict.fromkeys(etiquetas_mencionadas))
+                print(f"   🖼️ Imágenes referenciadas en respuesta: {['Imagen ' + e for e in etiquetas_unicas]}")
+                
+                try:
+                    # Construir patrones de búsqueda amplios
+                    patrones = []
+                    for e in etiquetas_unicas:
+                        patrones.append(f"Imagen {e}")
+                        patrones.append(f"Fig {e}")
+                        patrones.append(f"Figura {e}")
+                        patrones.append(e)  # solo el número "15.1"
+                    print(f"   🔍 DEBUG: Buscando patrones: {patrones[:6]}...")
+                    query = """
+                        MATCH (i:Imagen)
+                        WHERE i.path IS NOT NULL
+                        AND ANY(p IN $patrones WHERE 
+                            toLower(coalesce(i.etiqueta,'')) CONTAINS toLower(p) OR
+                            toLower(coalesce(i.caption,'')) CONTAINS toLower(p) OR
+                            toLower(coalesce(i.nombre_archivo,'')) CONTAINS toLower(p)
+                        )
+                        RETURN i.id AS id,
+                               coalesce(i.caption, i.texto_pagina, '') AS texto,
+                               i.fuente AS fuente,
+                               'imagen' AS tipo,
+                               i.path AS imagen_path,
+                               0.95 AS similitud,
+                               coalesce(i.nombre_archivo, '') AS nombre_archivo,
+                               coalesce(i.etiqueta, '') AS etiqueta,
+                               'referencia_respuesta' AS origen
+                        LIMIT 10
+                    """
+                    imgs_referenciadas = await self.neo4j.run(query, {"patrones": patrones})
+                    print(f"   🔍 DEBUG: Neo4j devolvió {len(imgs_referenciadas)} imágenes")
+                    
+                    if imgs_referenciadas:
+                        # Ordenar según orden de mención en la respuesta
+                        orden_mencion = {}
+                        for i, e in enumerate(etiquetas_unicas):
+                            for fmt in [f"Imagen {e}", f"Fig {e}", f"Figura {e}", e]:
+                                orden_mencion[fmt.lower()] = i
+                        
+                        def orden_img(img):
+                            etiq = (img.get("etiqueta", "") or "").lower()
+                            for patron, idx in orden_mencion.items():
+                                if patron in etiq:
+                                    return idx
+                            return 999
+                        
+                        imgs_referenciadas.sort(key=orden_img)
+                        
+                        # Mostrar todas las imágenes referenciadas (sin límite artificial)
+                        imgs_para_mostrar = self.neo4j.extraer_imagenes_de_resultados(
+                            resultados=imgs_referenciadas,
+                            top_k=len(imgs_referenciadas)
+                        )
+                        if imgs_para_mostrar:
+                            state["imagenes_para_mostrar"] = imgs_para_mostrar
+                            state["mostrar_imagenes"] = True
+                            print(f"   ✅ {len(imgs_para_mostrar)} imágenes encontradas por referencia en respuesta")
+                            for img in imgs_para_mostrar:
+                                print(f"      → {img.get('etiqueta', '')} | {img.get('nombre_archivo', '')}")
+                        else:
+                            print("   ⚠️ Imágenes referenciadas no encontradas en disco")
+                    else:
+                        print("   ⚠️ No se encontraron nodos :Imagen para las etiquetas mencionadas")
+                except Exception as e:
+                    print(f"   ⚠️ Error buscando imágenes por referencia: {e}")
+
         # Guardar siempre en memoria, no solo cuando hay contexto suficiente
         if state.get("respuesta_final"):
             self.memoria.add_interaction(state["consulta_texto"], state["respuesta_final"])
