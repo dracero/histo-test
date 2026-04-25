@@ -6,7 +6,8 @@
 #      Consultas sin imagen saltan procesar_imagen y analisis_comparativo.
 #   2. ROUTER CONDICIONAL: _route_por_modo decide el camino del grafo.
 #   3. UMBRALES DIFERENCIADOS: texto puro usa umbral 0.45 (más permisivo),
-#      modo imagen mantiene 0.6 para texto y 0.45 para imágenes.
+#      modo imagen mantiene 0.6 para texto y 0.70 para imágenes.
+#      UNI requiere ≥0.90, PLIP requiere ≥0.92 en búsqueda híbrida.
 #   4. SYSTEM PROMPT DIFERENCIADO: modo texto tiene prompt optimizado para
 #      respuestas enciclopédicas sin referencias a imágenes del usuario.
 #   5. MEJOR MANEJO DE NO-CONTEXTO: en modo texto, mensaje amable indicando
@@ -1117,8 +1118,8 @@ class Neo4jClient:
             if res_uni_raw:
                 top_sim = res_uni_raw[0].get("similitud", 0)
                 print(f"   👁️ Top similitud UNI: {top_sim:.4f} ({os.path.basename(res_uni_raw[0].get('imagen_path', ''))})")
-            # Umbral estricto para aceptar imágenes visualmente similares (evita forzar falsos positivos)
-            res_uni = [r for r in res_uni_raw if r.get("similitud", 0) >= 0.80]
+            # Umbral estricto: solo aceptar imágenes realmente similares
+            res_uni = [r for r in res_uni_raw if r.get("similitud", 0) >= 0.90]
 
         # 3. Búsqueda Imagen PLIP
         if imagen_embedding_plip:
@@ -1126,7 +1127,8 @@ class Neo4jClient:
             if res_plip_raw:
                 top_sim = res_plip_raw[0].get("similitud", 0)
                 print(f"   👁️ Top similitud PLIP: {top_sim:.4f} ({os.path.basename(res_plip_raw[0].get('imagen_path', ''))})")
-            res_plip = [r for r in res_plip_raw if r.get("similitud", 0) >= 0.80]
+            # PLIP tiende a dar scores más altos que UNI, usar umbral más estricto
+            res_plip = [r for r in res_plip_raw if r.get("similitud", 0) >= 0.92]
 
         # 4. Entidades
         res_ent = await self.busqueda_por_entidades(entidades, top_k)
@@ -1204,13 +1206,9 @@ class Neo4jClient:
         else:
             print(f"   🔍 DEBUG: 0 imágenes en res_vec (vecindad) — {len(res_vec)} resultados totales")
 
-        # Garantizar que imágenes de vecindad entren en el resultado final
-        # Las imágenes de vecindad son contextualmente relevantes (conectadas en el grafo)
-        # pero su similitud ponderada (0.3 * 0.20 = 0.06) es demasiado baja para competir
-        # con chunks de texto. Boost para asegurar inclusión.
-        for key, val in combined.items():
-            if val.get("tipo") == "imagen" and val.get("origen") == "vecindad":
-                val["similitud"] = max(val["similitud"], 0.50)  # Mínimo 0.50 para imágenes de vecindad
+        # Garantizar que imágenes de vecindad tengan un score razonable
+        # pero NO bypasear el umbral de similitud — si no son similares, no son relevantes
+        # (Removido boost artificial que causaba falsos positivos)
 
         final = sorted(combined.values(), key=lambda x: x["similitud"], reverse=True)
 
@@ -2720,11 +2718,10 @@ class AsistenteHistologiaNeo4j:
             if r.get("tipo") == "texto" and current_sim < umbral_texto:
                 continue
             
-            # Filter images by threshold, UNLESS they come from graph expansion
-            if r.get("tipo") == "imagen":
-                es_vecindad = r.get("origen") == "vecindad"
-                if not es_vecindad and current_sim < umbral_imagen:
-                    continue
+            # Filter images by threshold — ALL images must meet the threshold
+            # Vecindad images are no longer exempt (prevents false positives)
+            if r.get("tipo") == "imagen" and current_sim < umbral_imagen:
+                continue
 
             # Si es imagen pero no existe el archivo en disco, lo rechazamos
             # (applies to ALL images, regardless of origen)
