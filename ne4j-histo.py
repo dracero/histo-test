@@ -5,9 +5,10 @@
 #   1. REFACTORING CONSULTAS DE TEXTO: Flujo bifurcado en LangGraph.
 #      Consultas sin imagen saltan procesar_imagen y analisis_comparativo.
 #   2. ROUTER CONDICIONAL: _route_por_modo decide el camino del grafo.
-#   3. UMBRALES DIFERENCIADOS: texto puro usa umbral 0.45 (más permisivo),
-#      modo imagen mantiene 0.6 para texto y 0.70 para imágenes.
-#      UNI requiere ≥0.90, PLIP requiere ≥0.92 en búsqueda híbrida.
+#   3. UMBRALES DIFERENCIADOS: 
+#      - Modo texto puro: umbral texto 0.45, umbral imagen 0.95 (casi imposible)
+#      - Modo imagen: umbral texto 0.6, umbral imagen 0.70
+#      - Búsqueda híbrida: UNI ≥0.90, PLIP ≥0.92 (solo cuando hay imagen)
 #   4. SYSTEM PROMPT DIFERENCIADO: modo texto tiene prompt optimizado para
 #      respuestas enciclopédicas sin referencias a imágenes del usuario.
 #   5. MEJOR MANEJO DE NO-CONTEXTO: en modo texto, mensaje amable indicando
@@ -1096,24 +1097,120 @@ class Neo4jClient:
         
         return imagenes_finales
 
+    async def busqueda_imagenes_por_texto(self, texto_embedding: List[float], 
+                                            top_k: int = 10) -> List[Dict]:
+        """
+        Busca imágenes usando el texto asociado (caption, texto_pagina, OCR).
+        Útil cuando el usuario pide "mostrar imágenes de X" sin subir una imagen.
+        
+        Estrategia: Buscar imágenes cuyo texto asociado sea semánticamente similar
+        al texto de la consulta usando embeddings.
+        """
+        try:
+            # Buscar chunks de texto relevantes primero
+            chunks = await self.busqueda_vectorial(texto_embedding, INDEX_TEXTO, top_k * 3)
+            
+            if not chunks:
+                return []
+            
+            # Extraer términos clave de los chunks más relevantes
+            # para filtrar imágenes por contenido textual
+            fuentes_relevantes = {}
+            for chunk in chunks[:5]:
+                fuente = chunk.get("fuente")
+                if fuente:
+                    if fuente not in fuentes_relevantes:
+                        fuentes_relevantes[fuente] = []
+                    fuentes_relevantes[fuente].append({
+                        "similitud": chunk.get("similitud", 0),
+                        "texto": chunk.get("texto", "")[:200]
+                    })
+            
+            # Buscar imágenes de los PDFs relevantes
+            imagenes = []
+            
+            for fuente, chunks_info in fuentes_relevantes.items():
+                # Buscar imágenes de este PDF con texto asociado
+                query = """
+                    MATCH (i:Imagen {fuente: $fuente})
+                    WHERE i.path IS NOT NULL
+                    AND (
+                        (i.caption IS NOT NULL AND i.caption <> '') OR
+                        (i.texto_pagina IS NOT NULL AND i.texto_pagina <> '') OR
+                        (i.ocr_text IS NOT NULL AND i.ocr_text <> '')
+                    )
+                    RETURN i.id AS id,
+                           CASE 
+                               WHEN i.caption IS NOT NULL AND i.caption <> '' THEN i.caption
+                               WHEN i.texto_pagina IS NOT NULL AND i.texto_pagina <> '' THEN i.texto_pagina
+                               WHEN i.ocr_text IS NOT NULL AND i.ocr_text <> '' THEN i.ocr_text
+                               ELSE ''
+                           END AS texto,
+                           i.fuente AS fuente,
+                           'imagen' AS tipo,
+                           i.path AS imagen_path,
+                           i.pagina AS pagina,
+                           coalesce(i.nombre_archivo, '') AS nombre_archivo,
+                           coalesce(i.etiqueta, '') AS etiqueta
+                    ORDER BY i.pagina
+                    LIMIT 20
+                """
+                imgs = await self.run(query, {"fuente": fuente})
+                
+                # Calcular similitud semántica entre el texto de la imagen
+                # y los chunks relevantes usando embeddings
+                for img in imgs:
+                    img_texto = img.get("texto", "")
+                    if not img_texto or len(img_texto) < 10:
+                        continue
+                    
+                    # Calcular similitud con los chunks del mismo PDF
+                    max_sim = 0.0
+                    for chunk_info in chunks_info:
+                        # Similitud simple: contar palabras en común
+                        chunk_words = set(chunk_info["texto"].lower().split())
+                        img_words = set(img_texto.lower().split())
+                        if len(chunk_words) > 0 and len(img_words) > 0:
+                            overlap = len(chunk_words & img_words)
+                            sim = overlap / min(len(chunk_words), len(img_words))
+                            max_sim = max(max_sim, sim * chunk_info["similitud"])
+                    
+                    if max_sim > 0.15:  # Umbral mínimo de relevancia
+                        img["similitud"] = max_sim
+                        img["origen"] = "texto_asociado"
+                        imagenes.append(img)
+            
+            # Ordenar por similitud y retornar top_k
+            imagenes.sort(key=lambda x: x.get("similitud", 0), reverse=True)
+            return imagenes[:top_k]
+            
+        except Exception as e:
+            print(f"   ⚠️ Error búsqueda imágenes por texto: {e}")
+            return []
+
     async def busqueda_hibrida(self,
                                 texto_embedding: Optional[List[float]],
                                 imagen_embedding_uni: Optional[List[float]],
                                 imagen_embedding_plip: Optional[List[float]],
                                 entidades: Dict[str, List[str]],
+                                solicita_imagenes: bool = False,
                                 top_k: int = 10) -> List[Dict]:
         res_texto = []
         res_uni   = []
         res_plip  = []
         res_ent   = []
         res_vec   = []
+        res_img_texto = []  # Búsqueda de imágenes por texto asociado
+
+        # Detectar si es consulta con imagen
+        tiene_imagen = imagen_embedding_uni is not None or imagen_embedding_plip is not None
 
         # 1. Búsqueda Texto (Gemini)
         if texto_embedding:
             res_texto = await self.busqueda_vectorial(texto_embedding, INDEX_TEXTO, top_k)
 
-        # 2. Búsqueda Imagen UNI
-        if imagen_embedding_uni:
+        # 2. Búsqueda Imagen UNI (SOLO si hay imagen en la consulta)
+        if imagen_embedding_uni and tiene_imagen:
             res_uni_raw = await self.busqueda_vectorial(imagen_embedding_uni, INDEX_UNI, top_k)
             if res_uni_raw:
                 top_sim = res_uni_raw[0].get("similitud", 0)
@@ -1121,14 +1218,19 @@ class Neo4jClient:
             # Umbral estricto: solo aceptar imágenes realmente similares
             res_uni = [r for r in res_uni_raw if r.get("similitud", 0) >= 0.90]
 
-        # 3. Búsqueda Imagen PLIP
-        if imagen_embedding_plip:
+        # 3. Búsqueda Imagen PLIP (SOLO si hay imagen en la consulta)
+        if imagen_embedding_plip and tiene_imagen:
             res_plip_raw = await self.busqueda_vectorial(imagen_embedding_plip, INDEX_PLIP, top_k)
             if res_plip_raw:
                 top_sim = res_plip_raw[0].get("similitud", 0)
                 print(f"   👁️ Top similitud PLIP: {top_sim:.4f} ({os.path.basename(res_plip_raw[0].get('imagen_path', ''))})")
             # PLIP tiende a dar scores más altos que UNI, usar umbral más estricto
             res_plip = [r for r in res_plip_raw if r.get("similitud", 0) >= 0.92]
+        
+        # 3b. Búsqueda de imágenes por texto asociado (cuando usuario solicita imágenes sin subirlas)
+        if solicita_imagenes and not tiene_imagen and texto_embedding:
+            print("   🔍 Buscando imágenes por texto asociado (caption/OCR/página)...")
+            res_img_texto = await self.busqueda_imagenes_por_texto(texto_embedding, top_k=10)
 
         # 4. Entidades
         res_ent = await self.busqueda_por_entidades(entidades, top_k)
@@ -1141,7 +1243,7 @@ class Neo4jClient:
 
         # Cross-reference: para imagen matches fuertes, traer chunks de la misma página
         res_pag_chunks = []
-        tiene_imagen = imagen_embedding_uni is not None or imagen_embedding_plip is not None
+        # SOLO hacer cross-reference si hay imagen en la consulta
         if tiene_imagen:
             top_img_results = [r for r in (res_uni + res_plip) if r.get("similitud", 0) > 0.75]
             for img_r in top_img_results[:3]:
@@ -1188,6 +1290,11 @@ class Neo4jClient:
             agregar(res_plip,  0.70, es_visual=True)  # PLIP domina visual
             agregar(res_ent,   0.60)  # Entidades siempre importantes
             agregar(res_pag_chunks, 0.50)  # Chunks de la misma página que la imagen matcheada
+        elif solicita_imagenes:
+            # Usuario pide imágenes sin subirlas: priorizar imágenes encontradas por texto
+            agregar(res_texto, 0.50)  # Texto importante para contexto
+            agregar(res_img_texto, 0.80)  # Imágenes por texto asociado dominan
+            agregar(res_ent,   0.60)  # Entidades siempre importantes
         else:
             agregar(res_texto, 0.80)  # Texto domina sin imagen
             agregar(res_uni,   0.20, es_visual=True)  # UNI poco relevante sin query visual
@@ -1218,7 +1325,8 @@ class Neo4jClient:
 
         print(f"   📊 Híbrida: Txt={len(res_texto)} | "
               f"UNI={len(res_uni)} | PLIP={len(res_plip)} | Ent={len(res_ent)} | "
-              f"Vec={len(res_vec)} | PagCtx={len(res_pag_chunks)} -> {len(final)}")
+              f"Vec={len(res_vec)} | PagCtx={len(res_pag_chunks)} | "
+              f"ImgTxt={len(res_img_texto)} -> {len(final)}")
 
         return final[:15]
 
@@ -2515,9 +2623,24 @@ class AsistenteHistologiaNeo4j:
         1. Extrae términos histológicos y entidades para la búsqueda.
         2. Usa ClasificadorSemantico (ImageBind + LLM) para verificar dominio.
            Reemplaza la verificación por keywords de v4.0.
+        3. Detecta si el usuario solicita imágenes explícitamente.
         """
         t0 = time.time()
         print("🔍 Clasificando consulta (semántico v4.1)...")
+
+        # ── Detección de solicitud de imágenes ─────────────────────────
+        # Detectar si el usuario pide ver/mostrar imágenes explícitamente
+        consulta_lower = state["consulta_texto"].lower()
+        palabras_clave_imagenes = [
+            "mostrar imagen", "mostrame imagen", "ver imagen", "quiero imagen",
+            "dame imagen", "buscar imagen", "imagen de", "imágenes de",
+            "foto de", "fotos de", "picture", "show image", "ver foto"
+        ]
+        solicita_imagenes = any(kw in consulta_lower for kw in palabras_clave_imagenes)
+        state["solicita_imagenes"] = solicita_imagenes
+        
+        if solicita_imagenes:
+            print("   🖼️ Usuario solicita imágenes explícitamente")
 
         # ── Extracción de términos ─────────────────────────────────────
         # SOLO extraer de la consulta del usuario y contexto de memoria.
@@ -2657,6 +2780,7 @@ class AsistenteHistologiaNeo4j:
             imagen_embedding_uni   = state.get("imagen_embedding_uni"),
             imagen_embedding_plip  = state.get("imagen_embedding_plip"),
             entidades              = state.get("entidades_consulta", {}),
+            solicita_imagenes      = state.get("solicita_imagenes", False),
             top_k                  = 10
         )
 
@@ -2683,7 +2807,12 @@ class AsistenteHistologiaNeo4j:
         )
         
         state["imagenes_para_mostrar"] = imgs_para_mostrar
-        if imgs_para_mostrar:
+        
+        # Si el usuario solicitó imágenes explícitamente, activar mostrar_imagenes
+        if state.get("solicita_imagenes") and imgs_para_mostrar:
+            state["mostrar_imagenes"] = True
+            print(f"   ✅ {len(imgs_para_mostrar)} imágenes extraídas para mostrar al usuario")
+        elif imgs_para_mostrar:
             print(f"   ✅ {len(imgs_para_mostrar)} imágenes extraídas (disponibles si el usuario las pidió)")
         else:
             print("   ℹ️ No se encontraron imágenes en los resultados recuperados")
@@ -2706,11 +2835,24 @@ class AsistenteHistologiaNeo4j:
 
     async def _nodo_filtrar_contexto(self, state: AgentState) -> AgentState:
         t0     = time.time()
-        umbral_imagen = self.SIMILARITY_THRESHOLD
         es_solo_texto = not state.get("tiene_imagen", False)
-
-        # Umbral de texto más permisivo en modo solo texto
-        umbral_texto = 0.45 if es_solo_texto else 0.6
+        solicita_imagenes = state.get("solicita_imagenes", False)
+        
+        # Umbrales diferenciados por modo
+        if es_solo_texto:
+            if solicita_imagenes:
+                # Usuario pide imágenes explícitamente: umbral más permisivo
+                umbral_texto = 0.45
+                umbral_imagen = 0.50  # Permisivo para búsqueda por texto
+                print(f"   🖼️ Modo: Búsqueda de imágenes por texto (umbral imagen={umbral_imagen})")
+            else:
+                # Modo texto puro: solo texto relevante, imágenes casi imposibles
+                umbral_texto = 0.45
+                umbral_imagen = 0.95  # Casi imposible - solo imágenes perfectamente etiquetadas
+        else:
+            # Modo imagen: texto más estricto, imágenes con umbral normal
+            umbral_texto = 0.6
+            umbral_imagen = self.SIMILARITY_THRESHOLD  # 0.70
 
         validos = []
         for r in state["resultados_busqueda"]:
@@ -2718,8 +2860,8 @@ class AsistenteHistologiaNeo4j:
             if r.get("tipo") == "texto" and current_sim < umbral_texto:
                 continue
             
-            # Filter images by threshold — ALL images must meet the threshold
-            # Vecindad images are no longer exempt (prevents false positives)
+            # Filter images by threshold
+            # Umbral depende del modo (texto con solicitud de imágenes vs imagen subida)
             if r.get("tipo") == "imagen" and current_sim < umbral_imagen:
                 continue
 
@@ -3177,15 +3319,24 @@ class AsistenteHistologiaNeo4j:
 
     async def _nodo_finalizar(self, state: AgentState) -> AgentState:
         # ── Post-procesamiento: extraer imágenes referenciadas en la respuesta ──
-        # Solo buscar imágenes si el usuario las pidió explícitamente
+        # Solo buscar imágenes por etiqueta si:
+        # 1. El usuario pidió imágenes
+        # 2. Las etiquetas son REALES (contienen punto decimal como "15.1", "3.2")
+        #    NO etiquetas genéricas del LLM como "1", "2", "3"
         respuesta = state.get("respuesta_final", "")
         usuario_pidio_imagenes = state.get("mostrar_imagenes", False)
-        if respuesta and self.neo4j and usuario_pidio_imagenes:
+        
+        # Si ya tenemos imágenes de la búsqueda, NO sobrescribir con búsqueda por etiquetas
+        ya_tiene_imagenes = len(state.get("imagenes_para_mostrar", [])) > 0
+        
+        if respuesta and self.neo4j and usuario_pidio_imagenes and not ya_tiene_imagenes:
             import re
             # Capturar múltiples formatos de referencia a imágenes:
             # "Imagen 15.1", "Imagen 15.1:", "imagen 3.2", "Fig 3A", "Figura 5.1"
+            # SOLO etiquetas con punto decimal o letra (reales del manual)
+            # Excluir números simples como "1", "2", "3" (genéricos del LLM)
             etiquetas_mencionadas = re.findall(
-                r'(?:[Ii]magen|[Ff]ig(?:ura)?)\s+(\d+(?:\.\d+)?[A-Za-z]?)', respuesta
+                r'(?:[Ii]magen|[Ff]ig(?:ura)?)\s+(\d+\.\d+[A-Za-z]?|\d+[A-Za-z])', respuesta
             )
             print(f"   🔍 DEBUG finalizar: etiquetas encontradas en respuesta = {etiquetas_mencionadas}")
             if etiquetas_mencionadas:
@@ -3199,7 +3350,8 @@ class AsistenteHistologiaNeo4j:
                         patrones.append(f"Imagen {e}")
                         patrones.append(f"Fig {e}")
                         patrones.append(f"Figura {e}")
-                        patrones.append(e)  # solo el número "15.1"
+                        # NO agregar solo el número (ej: "1") porque matchea demasiado
+                        # (ej: "arch4_pag1", "arch4_pag10", "arch4_pag21")
                         # Variante con espacio antes del decimal (ej: "13. 4" en vez de "13.4")
                         if '.' in e:
                             parts = e.split('.', 1)
@@ -3212,8 +3364,7 @@ class AsistenteHistologiaNeo4j:
                         WHERE i.path IS NOT NULL
                         AND ANY(p IN $patrones WHERE 
                             toLower(coalesce(i.etiqueta,'')) CONTAINS toLower(p) OR
-                            toLower(coalesce(i.caption,'')) CONTAINS toLower(p) OR
-                            toLower(coalesce(i.nombre_archivo,'')) CONTAINS toLower(p)
+                            toLower(coalesce(i.caption,'')) CONTAINS toLower(p)
                         )
                         RETURN i.id AS id,
                                coalesce(i.caption, i.texto_pagina, '') AS texto,
