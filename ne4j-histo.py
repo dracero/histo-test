@@ -3146,9 +3146,13 @@ class AsistenteHistologiaNeo4j:
                 "El usuario pidió ver imágenes del manual. Se encontraron las siguientes "
                 "imágenes relevantes que se mostrarán junto a tu respuesta:\n"
                 f"{imgs_listado}\n\n"
-                "INSTRUCCIÓN: Describí brevemente cada imagen encontrada usando la información "
-                "del caption del manual. Indicá qué muestra cada imagen y por qué es relevante "
-                "para la consulta del usuario. Las imágenes se mostrarán automáticamente.\n"
+                "INSTRUCCIONES PARA IMÁGENES:\n"
+                "1. ORDENÁ las imágenes por relevancia: primero la que mejor responde a la consulta.\n"
+                "2. Usá la etiqueta REAL del manual (ej: 'Imagen 19', 'Imagen 15.1') al referenciarlas.\n"
+                "   NO uses numeración propia como 'Imagen 1', 'Imagen 2'.\n"
+                "3. Describí brevemente cada imagen usando la información del caption del manual.\n"
+                "4. Indicá qué muestra cada imagen y por qué es relevante para la consulta.\n"
+                "5. Las imágenes se mostrarán automáticamente junto a tu respuesta.\n"
             )
 
         # ── Variables del estado necesarias para el system prompt ───────
@@ -3318,127 +3322,94 @@ class AsistenteHistologiaNeo4j:
         return state
 
     async def _nodo_finalizar(self, state: AgentState) -> AgentState:
-        # ── Post-procesamiento: extraer imágenes referenciadas en la respuesta ──
-        # Solo buscar imágenes por etiqueta si:
-        # 1. El usuario pidió imágenes
-        # 2. Las etiquetas son REALES (contienen punto decimal como "15.1", "3.2")
-        #    NO etiquetas genéricas del LLM como "1", "2", "3"
+        # ── Post-procesamiento: seleccionar imágenes por similitud semántica ──
+        # En vez de regex frágil, usamos embeddings para rankear las imágenes
+        # por relevancia respecto a la consulta del usuario.
         respuesta = state.get("respuesta_final", "")
         usuario_pidio_imagenes = state.get("mostrar_imagenes", False)
         
-        # Si ya tenemos imágenes de la búsqueda, NO sobrescribir con búsqueda por etiquetas
-        ya_tiene_imagenes = len(state.get("imagenes_para_mostrar", [])) > 0
-        
-        if respuesta and self.neo4j and usuario_pidio_imagenes and not ya_tiene_imagenes:
-            import re
-            # Capturar múltiples formatos de referencia a imágenes:
-            # "Imagen 15.1", "Imagen 15.1:", "imagen 3.2", "Fig 3A", "Figura 5.1"
-            # SOLO etiquetas con punto decimal o letra (reales del manual)
-            # Excluir números simples como "1", "2", "3" (genéricos del LLM)
-            etiquetas_mencionadas = re.findall(
-                r'(?:[Ii]magen|[Ff]ig(?:ura)?)\s+(\d+\.\d+[A-Za-z]?|\d+[A-Za-z])', respuesta
-            )
-            print(f"   🔍 DEBUG finalizar: etiquetas encontradas en respuesta = {etiquetas_mencionadas}")
-            if etiquetas_mencionadas:
-                etiquetas_unicas = list(dict.fromkeys(etiquetas_mencionadas))
-                print(f"   🖼️ Imágenes referenciadas en respuesta: {['Imagen ' + e for e in etiquetas_unicas]}")
+        if respuesta and self.neo4j and usuario_pidio_imagenes:
+            try:
+                consulta = state.get("consulta_texto", "")
+                texto_embedding = state.get("texto_embedding")
                 
-                try:
-                    # Construir patrones de búsqueda amplios
-                    patrones = []
-                    for e in etiquetas_unicas:
-                        patrones.append(f"Imagen {e}")
-                        patrones.append(f"Fig {e}")
-                        patrones.append(f"Figura {e}")
-                        # NO agregar solo el número (ej: "1") porque matchea demasiado
-                        # (ej: "arch4_pag1", "arch4_pag10", "arch4_pag21")
-                        # Variante con espacio antes del decimal (ej: "13. 4" en vez de "13.4")
-                        if '.' in e:
-                            parts = e.split('.', 1)
-                            spaced = f"{parts[0]}. {parts[1]}"
-                            patrones.append(f"Imagen {spaced}")
-                            patrones.append(spaced)
-                    print(f"   🔍 DEBUG: Buscando patrones: {patrones[:8]}...")
-                    query = """
-                        MATCH (i:Imagen)
-                        WHERE i.path IS NOT NULL
-                        AND ANY(p IN $patrones WHERE 
-                            toLower(coalesce(i.etiqueta,'')) CONTAINS toLower(p) OR
-                            toLower(coalesce(i.caption,'')) CONTAINS toLower(p)
-                        )
-                        RETURN i.id AS id,
-                               coalesce(i.caption, i.texto_pagina, '') AS texto,
-                               i.fuente AS fuente,
-                               'imagen' AS tipo,
-                               i.path AS imagen_path,
-                               0.95 AS similitud,
-                               coalesce(i.nombre_archivo, '') AS nombre_archivo,
-                               coalesce(i.etiqueta, '') AS etiqueta,
-                               'referencia_respuesta' AS origen
-                        LIMIT 10
-                    """
-                    imgs_referenciadas = await self.neo4j.run(query, {"patrones": patrones})
-                    print(f"   🔍 DEBUG: Neo4j devolvió {len(imgs_referenciadas)} imágenes")
+                if texto_embedding and consulta:
+                    # Traer TODAS las imágenes de las fuentes relevantes
+                    fuentes = set()
+                    for r in state.get("resultados_busqueda", []):
+                        f = r.get("fuente")
+                        if f:
+                            fuentes.add(f)
                     
-                    if imgs_referenciadas:
-                        # Ordenar según orden de mención en la respuesta
-                        orden_mencion = {}
-                        for i, e in enumerate(etiquetas_unicas):
-                            for fmt in [f"Imagen {e}", f"Fig {e}", f"Figura {e}", e]:
-                                orden_mencion[fmt.lower()] = i
+                    if fuentes:
+                        todas_imagenes = []
+                        for fuente in fuentes:
+                            imgs = await self.neo4j.run("""
+                                MATCH (i:Imagen {fuente: $fuente})
+                                WHERE i.path IS NOT NULL
+                                RETURN i.id AS id,
+                                       CASE 
+                                           WHEN i.caption IS NOT NULL AND i.caption <> '' THEN i.caption
+                                           WHEN i.texto_pagina IS NOT NULL AND i.texto_pagina <> '' THEN i.texto_pagina
+                                           WHEN i.ocr_text IS NOT NULL AND i.ocr_text <> '' THEN i.ocr_text
+                                           ELSE ''
+                                       END AS texto,
+                                       i.fuente AS fuente,
+                                       'imagen' AS tipo,
+                                       i.path AS imagen_path,
+                                       coalesce(i.nombre_archivo, '') AS nombre_archivo,
+                                       coalesce(i.etiqueta, '') AS etiqueta
+                            """, {"fuente": fuente})
+                            todas_imagenes.extend(imgs)
                         
-                        def orden_img(img):
-                            etiq = (img.get("etiqueta", "") or "").lower()
-                            for patron, idx in orden_mencion.items():
-                                if patron in etiq:
-                                    return idx
-                            return 999
-                        
-                        imgs_referenciadas.sort(key=orden_img)
-                        
-                        # Mostrar todas las imágenes referenciadas (sin límite artificial)
-                        imgs_para_mostrar = self.neo4j.extraer_imagenes_de_resultados(
-                            resultados=imgs_referenciadas,
-                            top_k=len(imgs_referenciadas)
-                        )
-                        if imgs_para_mostrar:
-                            state["imagenes_para_mostrar"] = imgs_para_mostrar
-                            state["mostrar_imagenes"] = True
-                            print(f"   ✅ {len(imgs_para_mostrar)} imágenes encontradas por referencia en respuesta")
-                            for img in imgs_para_mostrar:
-                                print(f"      → {img.get('etiqueta', '')} | {img.get('nombre_archivo', '')}")
-                        else:
-                            print("   ⚠️ Imágenes referenciadas no encontradas en disco")
-                    else:
-                        # Diagnóstico: buscar qué etiquetas existen en Neo4j
-                        print("   ⚠️ No se encontraron nodos :Imagen para las etiquetas mencionadas")
-                        try:
-                            debug_q = await self.neo4j.run(
-                                "MATCH (i:Imagen) WHERE i.etiqueta IS NOT NULL AND i.etiqueta <> '' "
-                                "RETURN i.etiqueta AS etiqueta, i.nombre_archivo AS archivo, i.path AS path "
-                                "LIMIT 20"
-                            )
-                            if debug_q:
-                                print(f"   🔍 DEBUG: Etiquetas existentes en Neo4j ({len(debug_q)}):")
-                                for d in debug_q[:10]:
-                                    print(f"      → etiqueta='{d.get('etiqueta')}' | archivo='{d.get('archivo')}' | path='{d.get('path')}'")
-                            else:
-                                # Si no hay etiquetas, buscar por caption
-                                debug_c = await self.neo4j.run(
-                                    "MATCH (i:Imagen) WHERE i.caption IS NOT NULL AND i.caption <> '' "
-                                    "RETURN i.caption AS caption, i.nombre_archivo AS archivo, i.path AS path "
-                                    "LIMIT 10"
+                        if todas_imagenes:
+                            # Calcular similitud semántica con embeddings
+                            textos_imgs = []
+                            for img in todas_imagenes:
+                                # Combinar etiqueta + caption para mejor matching
+                                etiq = img.get("etiqueta", "")
+                                caption = img.get("texto", "")
+                                texto_combinado = f"{etiq} {caption}".strip()
+                                textos_imgs.append(texto_combinado if texto_combinado else "sin descripción")
+                            
+                            # Generar embeddings para los textos de las imágenes
+                            embs_imgs = embed_documents_con_reintento(self.embeddings, textos_imgs)
+                            
+                            # Calcular similitud coseno con la consulta
+                            consulta_np = np.array(texto_embedding)
+                            for i, img in enumerate(todas_imagenes):
+                                emb_img = np.array(embs_imgs[i])
+                                # Similitud coseno
+                                sim = float(np.dot(consulta_np, emb_img) / 
+                                           (np.linalg.norm(consulta_np) * np.linalg.norm(emb_img) + 1e-8))
+                                img["similitud"] = sim
+                            
+                            # Ordenar por similitud semántica (mayor primero)
+                            todas_imagenes.sort(key=lambda x: x.get("similitud", 0), reverse=True)
+                            
+                            # Filtrar: solo imágenes con similitud razonable
+                            umbral_semantico = 0.35
+                            imgs_relevantes = [img for img in todas_imagenes if img.get("similitud", 0) >= umbral_semantico]
+                            
+                            if imgs_relevantes:
+                                # Extraer y validar las top imágenes
+                                imgs_para_mostrar = self.neo4j.extraer_imagenes_de_resultados(
+                                    resultados=imgs_relevantes,
+                                    top_k=min(5, len(imgs_relevantes))
                                 )
-                                if debug_c:
-                                    print(f"   🔍 DEBUG: No hay etiquetas, pero hay captions ({len(debug_c)}):")
-                                    for d in debug_c[:5]:
-                                        print(f"      → caption='{d.get('caption', '')[:80]}' | archivo='{d.get('archivo')}'")
-                                else:
-                                    print("   🔍 DEBUG: No hay etiquetas ni captions en nodos :Imagen")
-                        except Exception as de:
-                            print(f"   🔍 DEBUG error: {de}")
-                except Exception as e:
-                    print(f"   ⚠️ Error buscando imágenes por referencia: {e}")
+                                if imgs_para_mostrar:
+                                    state["imagenes_para_mostrar"] = imgs_para_mostrar
+                                    state["mostrar_imagenes"] = True
+                                    print(f"   ✅ {len(imgs_para_mostrar)} imágenes rankeadas por similitud semántica:")
+                                    for img in imgs_para_mostrar:
+                                        print(f"      → {img.get('etiqueta', '') or img.get('nombre_archivo', '')} | sim={img.get('similitud_semantica', 0):.3f}")
+                            else:
+                                print(f"   ⚠️ Ninguna imagen supera umbral semántico ({umbral_semantico})")
+                    
+            except Exception as e:
+                print(f"   ⚠️ Error en ranking semántico de imágenes: {e}")
+                import traceback
+                traceback.print_exc()
 
         # Guardar siempre en memoria, no solo cuando hay contexto suficiente
         if state.get("respuesta_final"):
