@@ -281,7 +281,7 @@ if IMAGENES_DIR.exists():
 def main():
     port = int(os.getenv("PORT", "10005"))
     print(f"🌐 Servidor en http://localhost:{port}")
-    uvicorn.run(app, host="0.0.0.0", port=port)
+    uvicorn.run("server:app", host="0.0.0.0", port=port, reload=True)
 
 
 if __name__ == "__main__":
