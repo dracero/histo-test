@@ -756,9 +756,10 @@ class Neo4jClient:
                 CASE WHEN v:Imagen THEN 'imagen' ELSE 'texto' END AS tipo,
                 CASE WHEN v:Imagen THEN v.path ELSE null END AS imagen_path,
                 CASE 
-                    WHEN (n:Imagen AND v:Imagen AND n.pagina = v.pagina) OR
-                         (n:Chunk AND v:Imagen AND n.fuente = v.fuente)
-                    THEN 0.95 
+                    WHEN (n:Imagen AND v:Imagen AND n.pagina = v.pagina)
+                    THEN 0.95
+                    WHEN (n:Chunk AND v:Imagen AND n.fuente = v.fuente)
+                    THEN 0.50
                     ELSE 0.3 
                 END AS similitud,
                 CASE WHEN v:Imagen THEN coalesce(v.nombre_archivo, '') ELSE '' END AS nombre_archivo,
@@ -1086,8 +1087,13 @@ class Neo4jClient:
         
         print(f"   ✅ Imágenes válidas: {len(imagenes_validas)}")
         
-        # Paso 3: Limitar a top-K
-        imagenes_finales = imagenes_validas[:top_k]
+        # Paso 3: Filtrar por similitud mínima y limitar a top-K
+        UMBRAL_MIN_SIMILITUD = 0.40
+        imagenes_filtradas = [img for img in imagenes_validas if img.get("similitud_semantica", 0) >= UMBRAL_MIN_SIMILITUD]
+        if len(imagenes_filtradas) < len(imagenes_validas):
+            descartadas = len(imagenes_validas) - len(imagenes_filtradas)
+            print(f"   🚫 {descartadas} imágenes descartadas por similitud < {UMBRAL_MIN_SIMILITUD}")
+        imagenes_finales = imagenes_filtradas[:top_k]
         
         # Logging de resultados finales
         if imagenes_finales:
@@ -2794,36 +2800,16 @@ class AsistenteHistologiaNeo4j:
         state["resultados_busqueda"] = resultados
         print(f"✅ {len(resultados)} resultados")
 
-        # --- Extracción de imágenes para mostrar ---
-        # Siempre intentar extraer imágenes de los resultados recuperados
-        # (si hay imágenes en la vecindad del grafo, son relevantes al contexto)
+        # Nota: Las imágenes para mostrar se seleccionan en _nodo_finalizar
+        # por match de etiqueta (regex + semántica), NO desde los resultados de vecindad.
+        # Esto evita inyectar imágenes irrelevantes en el prompt del LLM.
         print(f"   🔍 DEBUG: resultados_busqueda tiene {len(state['resultados_busqueda'])} elementos")
         print(f"   🔍 DEBUG: Tipos en resultados: {[r.get('tipo') for r in state['resultados_busqueda']]}")
-        print("   🖼️ Extrayendo imágenes de los resultados recuperados...")
         
-        imgs_para_mostrar = self.neo4j.extraer_imagenes_de_resultados(
-            resultados=state["resultados_busqueda"],
-            top_k=3
-        )
-        
-        state["imagenes_para_mostrar"] = imgs_para_mostrar
-        
-        # Si el usuario solicitó imágenes explícitamente, activar mostrar_imagenes
-        if state.get("solicita_imagenes") and imgs_para_mostrar:
+        # Si el usuario solicitó imágenes, marcar para que _nodo_finalizar las busque
+        if state.get("solicita_imagenes"):
             state["mostrar_imagenes"] = True
-            print(f"   ✅ {len(imgs_para_mostrar)} imágenes extraídas para mostrar al usuario")
-        elif imgs_para_mostrar:
-            print(f"   ✅ {len(imgs_para_mostrar)} imágenes extraídas (disponibles si el usuario las pidió)")
-        else:
-            print("   ℹ️ No se encontraron imágenes en los resultados recuperados")
-        
-        # ELIMINADO: Búsqueda adicional redundante
-        # imgs_para_mostrar = await self.neo4j.busqueda_imagenes_semantica(
-        #     texto_embedding=state.get("texto_embedding", []),
-        #     entidades=state.get("entidades_consulta", {}),
-        #     embeddings_model=self.embeddings,
-        #     top_k=3
-        # )
+            print("   🖼️ Usuario solicitó imágenes — se buscarán en _nodo_finalizar por etiqueta")
 
         state["trayectoria"].append({
             "nodo": "BuscarNeo4j", "hits": len(resultados),
@@ -3154,6 +3140,22 @@ class AsistenteHistologiaNeo4j:
                 "4. Indicá qué muestra cada imagen y por qué es relevante para la consulta.\n"
                 "5. Las imágenes se mostrarán automáticamente junto a tu respuesta.\n"
             )
+        elif state.get("solicita_imagenes") or state.get("mostrar_imagenes"):
+            # El usuario pidió imágenes pero aún no tenemos selección.
+            # Instruir al LLM para que referencie las etiquetas REALES del manual.
+            instruccion_imagenes = (
+                "\nINSTRUCCIONES PARA REFERENCIAS A IMÁGENES:\n"
+                "El usuario pidió ver imágenes. Las imágenes se seleccionarán automáticamente "
+                "según las etiquetas que menciones en tu respuesta.\n"
+                "REGLAS CRÍTICAS:\n"
+                "1. Usá ÚNICAMENTE las etiquetas REALES que aparecen en el texto del manual "
+                "(ej: 'Imagen 7', 'Imagen 15.1', 'Fig 3A'). Estas etiquetas están en las "
+                "secciones del manual que se te proporcionan.\n"
+                "2. NUNCA inventes numeración propia ('imagen 1', 'imagen 2'). Eso causa "
+                "que se muestren imágenes incorrectas.\n"
+                "3. Si en el texto del manual no hay etiquetas de imágenes relevantes, "
+                "simplemente no menciones imágenes.\n"
+            )
 
         # ── Variables del estado necesarias para el system prompt ───────
         analisis_comp_str   = _safe(state.get("analisis_comparativo"))
@@ -3322,31 +3324,55 @@ class AsistenteHistologiaNeo4j:
         return state
 
     async def _nodo_finalizar(self, state: AgentState) -> AgentState:
-        # ── Post-procesamiento: seleccionar imágenes por similitud semántica ──
-        # En vez de regex frágil, usamos embeddings para rankear las imágenes
-        # por relevancia respecto a la consulta del usuario.
+        # ── Post-procesamiento: extraer imágenes por match de etiqueta ──
+        # Tier 1: Regex — extraer "Imagen X.X" de la respuesta del LLM y buscar etiquetas con CONTAINS
+        # Tier 2: Semántica — comparar la consulta contra el texto de las etiquetas (coseno)
+        # Máximo 3 imágenes, solo las que realmente matchean.
         respuesta = state.get("respuesta_final", "")
         usuario_pidio_imagenes = state.get("mostrar_imagenes", False)
+        MAX_IMGS = 3
         
         if respuesta and self.neo4j and usuario_pidio_imagenes:
             try:
                 consulta = state.get("consulta_texto", "")
                 texto_embedding = state.get("texto_embedding")
+                imgs_matcheadas = []
+                etiquetas_ya_usadas = set()
                 
-                if texto_embedding and consulta:
-                    # Traer TODAS las imágenes de las fuentes relevantes
-                    fuentes = set()
-                    for r in state.get("resultados_busqueda", []):
-                        f = r.get("fuente")
-                        if f:
-                            fuentes.add(f)
+                # ── Tier 1: Regex — referencias explícitas en la respuesta ──
+                patrones_ref = [
+                    r'Imagen\s+(\d+(?:\.\d+)?[A-Za-z]?)',
+                    r'Fig(?:ura)?\.?\s*(\d+(?:\.\d+)?[A-Za-z]?)',
+                    r'Lámina\s+(\d+(?:\.\d+)?[A-Za-z]?)',
+                    r'Foto(?:grafía)?\s+(\d+(?:\.\d+)?[A-Za-z]?)',
+                ]
+                
+                referencias_encontradas = []
+                for patron in patrones_ref:
+                    for m in re.finditer(patron, respuesta, re.IGNORECASE):
+                        ref_completa = m.group(0).strip()
+                        if ref_completa not in referencias_encontradas:
+                            referencias_encontradas.append(ref_completa)
+                
+                if referencias_encontradas:
+                    print(f"   🔍 Tier 1 (regex): {len(referencias_encontradas)} refs → {referencias_encontradas[:6]}")
                     
-                    if fuentes:
-                        todas_imagenes = []
-                        for fuente in fuentes:
+                    for ref in referencias_encontradas:
+                        if len(imgs_matcheadas) >= MAX_IMGS:
+                            break
+                        ref_norm = re.sub(r'\s+', ' ', ref.strip())
+                        # Construir regex Cypher para match exacto del número
+                        # "Imagen 7" debe matchear "Imagen 7" o "Imagen 7A" pero NO "Imagen 70"
+                        # Escapar caracteres especiales y agregar boundary
+                        ref_escaped = re.escape(ref_norm)
+                        # Cypher regex: match ref seguido de un no-dígito o fin de string
+                        cypher_regex = f"(?i).*{ref_escaped}([^0-9].*|$)"
+                        try:
                             imgs = await self.neo4j.run("""
-                                MATCH (i:Imagen {fuente: $fuente})
+                                MATCH (i:Imagen)
                                 WHERE i.path IS NOT NULL
+                                AND i.etiqueta IS NOT NULL
+                                AND i.etiqueta =~ $regex
                                 RETURN i.id AS id,
                                        CASE 
                                            WHEN i.caption IS NOT NULL AND i.caption <> '' THEN i.caption
@@ -3358,58 +3384,109 @@ class AsistenteHistologiaNeo4j:
                                        'imagen' AS tipo,
                                        i.path AS imagen_path,
                                        coalesce(i.nombre_archivo, '') AS nombre_archivo,
-                                       coalesce(i.etiqueta, '') AS etiqueta
-                            """, {"fuente": fuente})
-                            todas_imagenes.extend(imgs)
-                        
-                        if todas_imagenes:
-                            # Calcular similitud semántica con embeddings
-                            textos_imgs = []
-                            for img in todas_imagenes:
-                                # Combinar etiqueta + caption para mejor matching
+                                       coalesce(i.etiqueta, '') AS etiqueta,
+                                       1.0 AS similitud
+                                LIMIT 2
+                            """, {"regex": cypher_regex})
+                            for img in imgs:
                                 etiq = img.get("etiqueta", "")
-                                caption = img.get("texto", "")
-                                texto_combinado = f"{etiq} {caption}".strip()
-                                textos_imgs.append(texto_combinado if texto_combinado else "sin descripción")
+                                if etiq and etiq not in etiquetas_ya_usadas:
+                                    etiquetas_ya_usadas.add(etiq)
+                                    imgs_matcheadas.append(img)
+                                    print(f"      ✅ Regex: '{ref_norm}' → {img.get('nombre_archivo', '')} | etiqueta: {etiq}")
+                                    if len(imgs_matcheadas) >= MAX_IMGS:
+                                        break
+                        except Exception as e:
+                            print(f"      ⚠️ Error regex '{ref_norm}': {e}")
+                
+                # ── Tier 2: Semántica — similitud consulta vs etiqueta ──
+                if len(imgs_matcheadas) < MAX_IMGS and texto_embedding and consulta:
+                    print(f"   🔍 Tier 2 (semántica): buscando por similitud de etiqueta...")
+                    try:
+                        # Traer todas las imágenes con etiqueta no vacía
+                        todas_imgs = await self.neo4j.run("""
+                            MATCH (i:Imagen)
+                            WHERE i.path IS NOT NULL
+                            AND i.etiqueta IS NOT NULL AND i.etiqueta <> ''
+                            RETURN i.id AS id,
+                                   CASE 
+                                       WHEN i.caption IS NOT NULL AND i.caption <> '' THEN i.caption
+                                       WHEN i.texto_pagina IS NOT NULL AND i.texto_pagina <> '' THEN i.texto_pagina
+                                       WHEN i.ocr_text IS NOT NULL AND i.ocr_text <> '' THEN i.ocr_text
+                                       ELSE ''
+                                   END AS texto,
+                                   i.fuente AS fuente,
+                                   'imagen' AS tipo,
+                                   i.path AS imagen_path,
+                                   coalesce(i.nombre_archivo, '') AS nombre_archivo,
+                                   coalesce(i.etiqueta, '') AS etiqueta
+                        """)
+                        
+                        if todas_imgs:
+                            # Filtrar las que ya fueron seleccionadas por regex
+                            candidatas = [img for img in todas_imgs 
+                                         if img.get("etiqueta", "") not in etiquetas_ya_usadas]
                             
-                            # Generar embeddings para los textos de las imágenes
-                            embs_imgs = embed_documents_con_reintento(self.embeddings, textos_imgs)
-                            
-                            # Calcular similitud coseno con la consulta
-                            consulta_np = np.array(texto_embedding)
-                            for i, img in enumerate(todas_imagenes):
-                                emb_img = np.array(embs_imgs[i])
-                                # Similitud coseno
-                                sim = float(np.dot(consulta_np, emb_img) / 
-                                           (np.linalg.norm(consulta_np) * np.linalg.norm(emb_img) + 1e-8))
-                                img["similitud"] = sim
-                            
-                            # Ordenar por similitud semántica (mayor primero)
-                            todas_imagenes.sort(key=lambda x: x.get("similitud", 0), reverse=True)
-                            
-                            # Filtrar: solo imágenes con similitud razonable
-                            umbral_semantico = 0.35
-                            imgs_relevantes = [img for img in todas_imagenes if img.get("similitud", 0) >= umbral_semantico]
-                            
-                            if imgs_relevantes:
-                                # Extraer y validar las top imágenes
-                                imgs_para_mostrar = self.neo4j.extraer_imagenes_de_resultados(
-                                    resultados=imgs_relevantes,
-                                    top_k=min(5, len(imgs_relevantes))
-                                )
-                                if imgs_para_mostrar:
-                                    state["imagenes_para_mostrar"] = imgs_para_mostrar
-                                    state["mostrar_imagenes"] = True
-                                    print(f"   ✅ {len(imgs_para_mostrar)} imágenes rankeadas por similitud semántica:")
-                                    for img in imgs_para_mostrar:
-                                        print(f"      → {img.get('etiqueta', '') or img.get('nombre_archivo', '')} | sim={img.get('similitud_semantica', 0):.3f}")
-                            else:
-                                print(f"   ⚠️ Ninguna imagen supera umbral semántico ({umbral_semantico})")
+                            if candidatas:
+                                # Generar embeddings solo de las etiquetas
+                                etiquetas_textos = [img.get("etiqueta", "") for img in candidatas]
+                                embs_etiquetas = embed_documents_con_reintento(self.embeddings, etiquetas_textos)
+                                
+                                q_emb = np.array(texto_embedding)
+                                scored = []
+                                for i, img in enumerate(candidatas):
+                                    e_emb = np.array(embs_etiquetas[i])
+                                    sim = float(q_emb @ e_emb / (np.linalg.norm(q_emb) * np.linalg.norm(e_emb) + 1e-10))
+                                    scored.append((sim, img))
+                                
+                                # Ordenar por similitud desc, filtrar con umbral estricto
+                                UMBRAL_ETIQUETA = 0.55
+                                scored.sort(key=lambda x: x[0], reverse=True)
+                                
+                                for sim, img in scored:
+                                    if len(imgs_matcheadas) >= MAX_IMGS:
+                                        break
+                                    if sim < UMBRAL_ETIQUETA:
+                                        break
+                                    etiq = img.get("etiqueta", "")
+                                    if etiq not in etiquetas_ya_usadas:
+                                        etiquetas_ya_usadas.add(etiq)
+                                        img["similitud"] = sim
+                                        imgs_matcheadas.append(img)
+                                        print(f"      ✅ Semántica: sim={sim:.3f} → {img.get('nombre_archivo', '')} | etiqueta: {etiq}")
+                                
+                                if not any(s >= UMBRAL_ETIQUETA for s, _ in scored):
+                                    top3 = scored[:3]
+                                    print(f"      ℹ️ Top etiquetas (bajo umbral {UMBRAL_ETIQUETA}):")
+                                    for s, img in top3:
+                                        print(f"         sim={s:.3f} | {img.get('etiqueta', '')}")
+                    except Exception as e:
+                        print(f"      ⚠️ Error tier 2 semántico: {e}")
+                
+                # ── Resultado final ──
+                if imgs_matcheadas:
+                    imgs_para_mostrar = self.neo4j.extraer_imagenes_de_resultados(
+                        resultados=imgs_matcheadas,
+                        top_k=MAX_IMGS
+                    )
+                    if imgs_para_mostrar:
+                        state["imagenes_para_mostrar"] = imgs_para_mostrar
+                        state["mostrar_imagenes"] = True
+                        print(f"   ✅ {len(imgs_para_mostrar)} imágenes finales (regex+semántica):")
+                        for img in imgs_para_mostrar:
+                            print(f"      → {img.get('etiqueta', '') or img.get('nombre_archivo', '')}")
+                    else:
+                        print("   ⚠️ Imágenes matcheadas no pasaron validación de disco")
+                        state["mostrar_imagenes"] = False
+                else:
+                    print("   ⚠️ Sin matches por regex ni semántica — no se muestran imágenes")
+                    state["mostrar_imagenes"] = False
                     
             except Exception as e:
-                print(f"   ⚠️ Error en ranking semántico de imágenes: {e}")
+                print(f"   ⚠️ Error extrayendo imágenes por etiqueta: {e}")
                 import traceback
                 traceback.print_exc()
+                state["mostrar_imagenes"] = False
 
         # Guardar siempre en memoria, no solo cuando hay contexto suficiente
         if state.get("respuesta_final"):
