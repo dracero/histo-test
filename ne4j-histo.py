@@ -793,8 +793,8 @@ class Neo4jClient:
             print(f"⚠️ Error búsqueda camino: {e}")
             return []
 
-    async def busqueda_imagenes_por_texto(self, entidades: Dict[str, List[str]], 
-                                          top_k: int = 5) -> List[Dict]:
+    async def busqueda_imagenes_por_palabras_clave(self, entidades: Dict[str, List[str]], 
+                                                   top_k: int = 5) -> List[Dict]:
         """Busca nodos :Imagen relacionados con las entidades, buscando en texto de página,
         OCR, caption, y también imágenes en las mismas páginas que chunks relevantes.
         Tolerante a tildes/acentos."""
@@ -905,7 +905,7 @@ class Neo4jClient:
         candidatas: Dict[str, Dict] = {}  # id -> imagen_dict
         
         # --- Fase 1a: Candidatas por texto (CONTAINS en caption/texto_pagina) ---
-        imgs_texto = await self.busqueda_imagenes_por_texto(entidades, top_k=top_k * 2)
+        imgs_texto = await self.busqueda_imagenes_por_palabras_clave(entidades, top_k=top_k * 2)
         for img in imgs_texto:
             img_id = img.get("id")
             if img_id and img_id not in candidatas:
@@ -1103,9 +1103,9 @@ class Neo4jClient:
         
         return imagenes_finales
 
-    async def busqueda_imagenes_por_texto(self, texto_embedding: List[float], 
-                                            top_k: int = 10,
-                                            embeddings_model=None) -> List[Dict]:
+    async def busqueda_imagenes_vectorial_caption(self, texto_embedding: List[float], 
+                                                  top_k: int = 10,
+                                                  embeddings_model=None) -> List[Dict]:
         """
         Busca imágenes usando el texto asociado (caption, texto_pagina, OCR).
         Útil cuando el usuario pide "mostrar imágenes de X" sin subir una imagen.
@@ -1276,9 +1276,12 @@ class Neo4jClient:
         
         # 3b. Búsqueda de imágenes por texto asociado (cuando usuario solicita imágenes sin subirlas)
         if solicita_imagenes and not tiene_imagen and texto_embedding:
-            print("   🔍 Buscando imágenes por texto asociado (caption/OCR/página)...")
-            res_img_texto = await self.busqueda_imagenes_por_texto(
-                texto_embedding, top_k=10, embeddings_model=embeddings_model
+            print("   🔍 Buscando imágenes por texto asociado (búsqueda semántica completa)...")
+            res_img_texto = await self.busqueda_imagenes_semantica(
+                texto_embedding=texto_embedding,
+                entidades=entidades,
+                embeddings_model=embeddings_model,
+                top_k=10
             )
 
         # 4. Entidades
@@ -2569,13 +2572,22 @@ class AsistenteHistologiaNeo4j:
         imagen_path_nuevo = state.get("imagen_path")
         imagen_es_nueva   = False
 
+        # Detectar si solicita imágenes explícitamente para evitar reusar la de memoria
+        consulta_lower = state["consulta_texto"].lower()
+        palabras_clave_imagenes = [
+            "mostrar imagen", "mostrame imagen", "ver imagen", "quiero imagen",
+            "dame imagen", "buscar imagen", "imagen de", "imágenes de",
+            "foto de", "fotos de", "picture", "show image", "ver foto"
+        ]
+        solicita_imagenes_local = any(kw in consulta_lower for kw in palabras_clave_imagenes)
+
         if imagen_path_nuevo and os.path.exists(imagen_path_nuevo):
             imagen_path_activo = imagen_path_nuevo
             imagen_es_nueva    = True
             # Se registrará en la memoria con su análisis después de generarlo
             print(f"   🆕 Nueva imagen: {imagen_path_activo}")
 
-        elif self.memoria.tiene_imagen_previa():
+        elif self.memoria.tiene_imagen_previa() and not solicita_imagenes_local:
             imagen_path_activo = self.memoria.get_imagen_activa()
             state["imagen_path"] = imagen_path_activo
             state["analisis_visual"] = self.memoria.analisis_visual_activo
@@ -2812,6 +2824,15 @@ class AsistenteHistologiaNeo4j:
         except Exception as e:
             state["consulta_busqueda_texto"]  = state["consulta_texto"][:77]
             state["consulta_busqueda_visual"] = ""
+
+        # Re-generar embedding con la consulta optimizada
+        ct_optimizado = state["consulta_busqueda_texto"]
+        if ct_optimizado:
+            try:
+                state["texto_embedding"] = self._embed_texto(ct_optimizado)
+                print(f"   🎯 Re-calculado texto_embedding con consulta optimizada: '{ct_optimizado}'")
+            except Exception as e:
+                print(f"⚠️ Error re-calculando embedding: {e}")
 
         print(f"   📝 query='{state['consulta_busqueda_texto']}'")
         state["trayectoria"].append({
@@ -3400,12 +3421,7 @@ class AsistenteHistologiaNeo4j:
                                 (i.etiqueta IS NOT NULL AND i.etiqueta <> '')
                             )
                             RETURN i.id AS id,
-                                   CASE 
-                                       WHEN i.caption IS NOT NULL AND i.caption <> '' THEN i.caption
-                                       WHEN i.texto_pagina IS NOT NULL AND i.texto_pagina <> '' THEN i.texto_pagina
-                                       WHEN i.ocr_text IS NOT NULL AND i.ocr_text <> '' THEN i.ocr_text
-                                       ELSE ''
-                                   END AS texto,
+                                   coalesce(i.caption, '') AS texto,
                                    i.fuente AS fuente,
                                    'imagen' AS tipo,
                                    i.path AS imagen_path,
@@ -3439,7 +3455,7 @@ class AsistenteHistologiaNeo4j:
                                     scored.append((sim, img))
                                 
                                 # Ordenar por similitud desc
-                                UMBRAL_CAPTION = 0.50
+                                UMBRAL_CAPTION = 0.45
                                 scored.sort(key=lambda x: x[0], reverse=True)
                                 
                                 # Mostrar top 5 para debug
@@ -3537,6 +3553,14 @@ class AsistenteHistologiaNeo4j:
                         print(f"   ✅ {len(imgs_para_mostrar)} imágenes finales (semántica+regex):")
                         for img in imgs_para_mostrar:
                             print(f"      → {img.get('etiqueta', '') or img.get('nombre_archivo', '')}")
+                        
+                        # Guardar la imagen más relevante en la memoria como activa para que persista
+                        top_img = imgs_para_mostrar[0]
+                        top_img_path = top_img.get("path")
+                        if top_img_path and os.path.exists(top_img_path):
+                            desc = top_img.get("caption") or top_img.get("etiqueta") or "Imagen recuperada"
+                            self.memoria.set_imagen(top_img_path, desc)
+                            print(f"   ♻️  Estableciendo {top_img.get('nombre_archivo')} como imagen activa en memoria")
                     else:
                         print("   ⚠️ Imágenes matcheadas no pasaron validación de disco")
                         state["mostrar_imagenes"] = False
