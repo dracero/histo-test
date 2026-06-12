@@ -1,0 +1,21 @@
+version: '3.8'
+
+services:
+  neo4j:
+    image: neo4j:5.20.0-community
+    container_name: neo4j-local-histo
+    ports:
+      - "7474:7474" # HTTP Console
+      - "7687:7687" # Bolt Protocol
+    volumes:
+      - ./neo4j-local/data:/data
+      - ./neo4j-local/logs:/logs
+      - ./neo4j-local/import:/import
+      - ./neo4j-local/plugins:/plugins
+    environment:
+      - NEO4J_AUTH=neo4j/password123
+      - NEO4J_PLUGINS=["apoc"]
+      - NEO4J_dbms_memory_pagecache_size=512M
+      - NEO4J_dbms_memory_heap_initial__size=512M
+      - NEO4J_dbms_memory_heap_max__size=1G
+    restart: unless-stopped

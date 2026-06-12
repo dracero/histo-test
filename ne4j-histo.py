@@ -3390,11 +3390,11 @@ class AsistenteHistologiaNeo4j:
 
     async def _nodo_finalizar(self, state: AgentState) -> AgentState:
         # ── Post-procesamiento: extraer imágenes por match de etiqueta ──
-        # Tier 1: Semántica — comparar consulta contra el CAPTION COMPLETO de cada imagen (coseno)
-        # Tier 2: Regex — extraer "Imagen X.X" de la respuesta del LLM y buscar etiquetas
-        # Prioridad: semántica primero (encuentra la imagen más relevante),
-        # luego regex complementa con imágenes que el LLM mencionó.
-        # Máximo 3 imágenes, solo las que realmente matchean.
+        # Tier 1: Regex — extraer "Imagen X.X" de la respuesta del LLM y buscar etiquetas en la BD.
+        #         Esto garantiza que se muestren exactamente las imágenes que el LLM referenció.
+        # Tier 2: Semántica — si quedan slots, rellenar comparando la consulta contra el CAPTION COMPLETO.
+        #         Usa un umbral elevado (0.60) para evitar ruido (ej: esófago en espermatozoides).
+        # Máximo 3 imágenes, ordenadas dando prioridad a las referencias del LLM.
         respuesta = state.get("respuesta_final", "")
         usuario_pidio_imagenes = state.get("mostrar_imagenes", False)
         MAX_IMGS = 3
@@ -3406,11 +3406,69 @@ class AsistenteHistologiaNeo4j:
                 imgs_matcheadas = []
                 etiquetas_ya_usadas = set()
                 
-                # ── Tier 1: Semántica — similitud consulta vs caption completo ──
-                # Se ejecuta PRIMERO para encontrar la imagen más relevante
-                # aunque el LLM no la haya mencionado en su respuesta.
-                if texto_embedding and consulta:
-                    print(f"   🔍 Tier 1 (semántica): buscando por similitud de caption...")
+                # ── Tier 1: Regex — referencias explícitas en la respuesta del LLM ──
+                # Prioridad absoluta: las imágenes que el LLM le indicó al usuario que viera.
+                patrones_ref = [
+                    r'Imagen\s+(\d+(?:\.\d+)?[A-Za-z]?)',
+                    r'Fig(?:ura)?\.?\s*(\d+(?:\.\d+)?[A-Za-z]?)',
+                    r'Lámina\s+(\d+(?:\.\d+)?[A-Za-z]?)',
+                    r'Foto(?:grafía)?\s+(\d+(?:\.\d+)?[A-Za-z]?)',
+                ]
+                
+                referencias_encontradas = []
+                for patron in patrones_ref:
+                    for m in re.finditer(patron, respuesta, re.IGNORECASE):
+                        ref_completa = m.group(0).strip()
+                        if ref_completa not in referencias_encontradas:
+                            referencias_encontradas.append(ref_completa)
+                
+                if referencias_encontradas:
+                    print(f"   🔍 Tier 1 (regex): {len(referencias_encontradas)} refs encontradas en respuesta → {referencias_encontradas[:6]}")
+                    
+                    for ref in referencias_encontradas:
+                        if len(imgs_matcheadas) >= MAX_IMGS:
+                            break
+                        ref_norm = re.sub(r'\s+', ' ', ref.strip())
+                        ref_escaped = re.escape(ref_norm)
+                        cypher_regex = f"(?i).*{ref_escaped}([^0-9].*|$)"
+                        try:
+                            imgs = await self.neo4j.run("""
+                                MATCH (i:Imagen)
+                                WHERE i.path IS NOT NULL
+                                AND i.etiqueta IS NOT NULL
+                                AND i.etiqueta =~ $regex
+                                RETURN i.id AS id,
+                                       CASE 
+                                           WHEN i.caption IS NOT NULL AND i.caption <> '' THEN i.caption
+                                           WHEN i.texto_pagina IS NOT NULL AND i.texto_pagina <> '' THEN i.texto_pagina
+                                           WHEN i.ocr_text IS NOT NULL AND i.ocr_text <> '' THEN i.ocr_text
+                                           ELSE ''
+                                       END AS texto,
+                                       i.fuente AS fuente,
+                                       'imagen' AS tipo,
+                                       i.path AS imagen_path,
+                                       coalesce(i.nombre_archivo, '') AS nombre_archivo,
+                                       coalesce(i.etiqueta, '') AS etiqueta,
+                                       0.95 AS similitud
+                                LIMIT 2
+                            """, {"regex": cypher_regex})
+                            for img in imgs:
+                                etiq = img.get("etiqueta", "")
+                                nombre = img.get("nombre_archivo", "")
+                                key = etiq or nombre
+                                if key and key not in etiquetas_ya_usadas:
+                                    etiquetas_ya_usadas.add(key)
+                                    imgs_matcheadas.append(img)
+                                    print(f"      ✅ Regex: '{ref_norm}' → {nombre} | etiqueta: {etiq}")
+                                    if len(imgs_matcheadas) >= MAX_IMGS:
+                                        break
+                        except Exception as e:
+                            print(f"      ⚠️ Error regex '{ref_norm}': {e}")
+                
+                # ── Tier 2: Semántica — similitud consulta vs caption completo (Relleno) ──
+                # Solo se ejecuta si aún quedan slots libres y hay embeddings.
+                if len(imgs_matcheadas) < MAX_IMGS and texto_embedding and consulta:
+                    print(f"   🔍 Tier 2 (semántica): buscando por similitud de caption ({len(imgs_matcheadas)}/{MAX_IMGS} ya asignadas)...")
                     try:
                         # Traer todas las imágenes con caption/texto no vacío
                         todas_imgs = await self.neo4j.run("""
@@ -3430,8 +3488,7 @@ class AsistenteHistologiaNeo4j:
                         """)
                         
                         if todas_imgs:
-                            # Usar el CAPTION COMPLETO para el embedding (no solo la etiqueta)
-                            # Esto permite matchear "espermatozoides" con "Imagen 19: Espermatozoides\nLos espermatozoides..."
+                            # Usar el CAPTION COMPLETO para el embedding
                             textos_para_embedding = []
                             candidatas_validas = []
                             for img in todas_imgs:
@@ -3455,7 +3512,7 @@ class AsistenteHistologiaNeo4j:
                                     scored.append((sim, img))
                                 
                                 # Ordenar por similitud desc
-                                UMBRAL_CAPTION = 0.45
+                                UMBRAL_CAPTION = 0.60  # Aumentado de 0.45 a 0.60 para evitar falsos positivos
                                 scored.sort(key=lambda x: x[0], reverse=True)
                                 
                                 # Mostrar top 5 para debug
@@ -3478,68 +3535,7 @@ class AsistenteHistologiaNeo4j:
                                         print(f"      ✅ Semántica: sim={sim:.3f} → {nombre} | etiqueta: {etiq}")
                                 
                     except Exception as e:
-                        print(f"      ⚠️ Error tier 1 semántico: {e}")
-                
-                # ── Tier 2: Regex — referencias explícitas en la respuesta del LLM ──
-                # Complementa con imágenes mencionadas por el LLM que no fueron
-                # encontradas por semántica.
-                if len(imgs_matcheadas) < MAX_IMGS:
-                    patrones_ref = [
-                        r'Imagen\s+(\d+(?:\.\d+)?[A-Za-z]?)',
-                        r'Fig(?:ura)?\.?\s*(\d+(?:\.\d+)?[A-Za-z]?)',
-                        r'Lámina\s+(\d+(?:\.\d+)?[A-Za-z]?)',
-                        r'Foto(?:grafía)?\s+(\d+(?:\.\d+)?[A-Za-z]?)',
-                    ]
-                    
-                    referencias_encontradas = []
-                    for patron in patrones_ref:
-                        for m in re.finditer(patron, respuesta, re.IGNORECASE):
-                            ref_completa = m.group(0).strip()
-                            if ref_completa not in referencias_encontradas:
-                                referencias_encontradas.append(ref_completa)
-                    
-                    if referencias_encontradas:
-                        print(f"   🔍 Tier 2 (regex): {len(referencias_encontradas)} refs → {referencias_encontradas[:6]}")
-                        
-                        for ref in referencias_encontradas:
-                            if len(imgs_matcheadas) >= MAX_IMGS:
-                                break
-                            ref_norm = re.sub(r'\s+', ' ', ref.strip())
-                            ref_escaped = re.escape(ref_norm)
-                            cypher_regex = f"(?i).*{ref_escaped}([^0-9].*|$)"
-                            try:
-                                imgs = await self.neo4j.run("""
-                                    MATCH (i:Imagen)
-                                    WHERE i.path IS NOT NULL
-                                    AND i.etiqueta IS NOT NULL
-                                    AND i.etiqueta =~ $regex
-                                    RETURN i.id AS id,
-                                           CASE 
-                                               WHEN i.caption IS NOT NULL AND i.caption <> '' THEN i.caption
-                                               WHEN i.texto_pagina IS NOT NULL AND i.texto_pagina <> '' THEN i.texto_pagina
-                                               WHEN i.ocr_text IS NOT NULL AND i.ocr_text <> '' THEN i.ocr_text
-                                               ELSE ''
-                                           END AS texto,
-                                           i.fuente AS fuente,
-                                           'imagen' AS tipo,
-                                           i.path AS imagen_path,
-                                           coalesce(i.nombre_archivo, '') AS nombre_archivo,
-                                           coalesce(i.etiqueta, '') AS etiqueta,
-                                           0.90 AS similitud
-                                    LIMIT 2
-                                """, {"regex": cypher_regex})
-                                for img in imgs:
-                                    etiq = img.get("etiqueta", "")
-                                    nombre = img.get("nombre_archivo", "")
-                                    key = etiq or nombre
-                                    if key and key not in etiquetas_ya_usadas:
-                                        etiquetas_ya_usadas.add(key)
-                                        imgs_matcheadas.append(img)
-                                        print(f"      ✅ Regex: '{ref_norm}' → {nombre} | etiqueta: {etiq}")
-                                        if len(imgs_matcheadas) >= MAX_IMGS:
-                                            break
-                            except Exception as e:
-                                print(f"      ⚠️ Error regex '{ref_norm}': {e}")
+                        print(f"      ⚠️ Error tier 2 semántico: {e}")
                 
                 # ── Resultado final ──
                 if imgs_matcheadas:
@@ -3550,7 +3546,7 @@ class AsistenteHistologiaNeo4j:
                     if imgs_para_mostrar:
                         state["imagenes_para_mostrar"] = imgs_para_mostrar
                         state["mostrar_imagenes"] = True
-                        print(f"   ✅ {len(imgs_para_mostrar)} imágenes finales (semántica+regex):")
+                        print(f"   ✅ {len(imgs_para_mostrar)} imágenes finales (regex+semántica):")
                         for img in imgs_para_mostrar:
                             print(f"      → {img.get('etiqueta', '') or img.get('nombre_archivo', '')}")
                         
@@ -3565,7 +3561,7 @@ class AsistenteHistologiaNeo4j:
                         print("   ⚠️ Imágenes matcheadas no pasaron validación de disco")
                         state["mostrar_imagenes"] = False
                 else:
-                    print("   ⚠️ Sin matches por semántica ni regex — no se muestran imágenes")
+                    print("   ⚠️ Sin matches por regex ni semántica — no se muestran imágenes")
                     state["mostrar_imagenes"] = False
                     
             except Exception as e:
