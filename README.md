@@ -70,6 +70,13 @@ El sistema organiza el conocimiento en los siguientes nodos y relaciones dentro 
 
 Existen diversos flujos diseñados específicamente para su respectiva plataforma de ejecución:
 
+**Opción 0: Levantar Base de Datos Local (Neo4j)**
+Si vas a correr la inferencia con la base de datos local (configuración por defecto), primero levanta el contenedor de Neo4j utilizando Docker Compose:
+```bash
+docker compose up -d
+```
+*Esto iniciará una instancia de Neo4j en `bolt://localhost:7687` (credenciales `neo4j` / `password`). La base estará vacía inicialmente.*
+
 **Opción A: Ingestión Remota en Google Colab (Pre-Procesado masivo)**
 Sube el archivo `notebooks/Ingesta_Neo4J_Histo.ipynb` a Google Colab o copialo de este [link](https://colab.research.google.com/drive/1r7AawAnFF_2yCxp4O37n64f3LiX8Lvk1?usp=sharing). Asigna una instancia T4 GPU, incluye los secretos arriba mencionados y ejecuta la Celda 2. Extraerá las imágenes masivamente de tus PDFs hacia el índice vectorial de Neo4j en la Nube.
 
