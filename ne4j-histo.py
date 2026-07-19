@@ -37,7 +37,7 @@ import glob
 from dotenv import load_dotenv
 
 # Cargar variables de entorno desde .env
-load_dotenv()
+load_dotenv(override=True)
 
 # UNI & PLIP
 import timm
@@ -64,7 +64,7 @@ from pdf2image import convert_from_path
 import pytesseract
 
 from langchain_huggingface import HuggingFaceEmbeddings
-from langchain_groq import ChatGroq
+from api_key_rotator import create_google_llm
 from langchain_core.messages import HumanMessage, SystemMessage
 
 from langgraph.graph import StateGraph, START, END
@@ -150,38 +150,12 @@ def _safe(value, default: str = "") -> str:
     return value if isinstance(value, str) and value else default
 
 async def invoke_con_reintento(llm, messages, max_retries=5):
-    import asyncio
-    for attempt in range(max_retries):
-        try:
-            return await llm.ainvoke(messages)
-        except Exception as e:
-            err_str = str(e)
-            if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str or "503" in err_str:
-                if attempt < max_retries - 1:
-                    espera = 15 * (attempt + 1)
-                    print(f"   ⚠️ Límite de cuota API/Servidor Ocupado (429/503) - reintentando en {espera}s... (Intento {attempt+1}/{max_retries})")
-                    await asyncio.sleep(espera)
-                else:
-                    raise e
-            else:
-                raise e
+    from api_key_rotator import ainvoke_with_retry
+    return await ainvoke_with_retry(llm, messages, max_retries=max_retries)
 
 def invoke_con_reintento_sync(llm, messages, max_retries=5):
-    import time
-    for attempt in range(max_retries):
-        try:
-            return llm.invoke(messages)
-        except Exception as e:
-            err_str = str(e)
-            if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str or "503" in err_str:
-                if attempt < max_retries - 1:
-                    espera = 15 * (attempt + 1)
-                    print(f"   ⚠️ Límite de cuota API/Servidor Ocupado (429/503) - reintentando en {espera}s... (Intento {attempt+1}/{max_retries})")
-                    time.sleep(espera)
-                else:
-                    raise e
-            else:
-                raise e
+    from api_key_rotator import invoke_with_retry
+    return invoke_with_retry(llm, messages, max_retries=max_retries)
 
 def embed_query_con_reintento(embeddings, texto: str, max_retries=5):
     import time
@@ -2096,10 +2070,19 @@ class ExtractorImagenesPDF:
 class ExtractorTemario:
     def __init__(self, llm):
         self.llm   = llm
-        self.temas: List[str] = []
-
     async def extraer_temario(self, texto_completo: str) -> List[str]:
-        print("📋 Extrayendo temario...")
+        cache_path = "temario_histologia.json"
+        if os.path.exists(cache_path):
+            try:
+                with open(cache_path, "r", encoding="utf-8") as f:
+                    self.temas = json.load(f)
+                if self.temas:
+                    print(f"📋 Cargando temario desde archivo local '{cache_path}' (caché) — {len(self.temas)} temas")
+                    return self.temas
+            except Exception as e:
+                print(f"⚠️ Error cargando caché de temario: {e}. Re-extrayendo...")
+
+        print("📋 Extrayendo temario usando LLM...")
         muestra = texto_completo[:8000]
         system = (
             "Eres un experto en histología. Genera una lista EXHAUSTIVA de temas, "
@@ -2253,7 +2236,7 @@ class AsistenteHistologiaNeo4j:
         if self.device == "cuda":
             try:
                 cap = torch.cuda.get_device_capability(0)
-                if cap[0] < 7:
+                if cap[0] < 6:
                     print(f"⚠️ GPU incompatible detectada (sm_{cap[0]}{cap[1]}). Forzando CPU para evitar fallback_error.")
                     self.device = "cpu"
             except:
@@ -2261,7 +2244,10 @@ class AsistenteHistologiaNeo4j:
         print(f"✅ AsistenteHistologiaNeo4j v4.2 inicializado en {self.device}")
 
     def _setup_apis(self):
-        os.environ["GOOGLE_API_KEY"] = userdata.get("GOOGLE_API_KEY") or ""
+        from api_key_rotator import google_key_rotator
+        google_key_rotator.load_keys()
+        if google_key_rotator._keys:
+            os.environ["GOOGLE_API_KEY"] = google_key_rotator._keys[0]
         print("✅ APIs configuradas")
 
     # ------------------------------------------------------------------
@@ -2299,12 +2285,9 @@ class AsistenteHistologiaNeo4j:
         print("✅ Todos los componentes inicializados")
 
     def _init_modelos(self):
-        self.llm = ChatGroq(
-            model="meta-llama/llama-4-scout-17b-16e-instruct",
-            api_key=userdata.get("GROQ_API_KEY"),
-            temperature=0, max_retries=1
-        )
-        print("✅ Groq inicializado")
+        model_name = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+        self.llm = create_google_llm(model=model_name, temperature=0.0)
+        print(f"✅ Gemini (con rotación) inicializado usando modelo: {model_name}")
         
         # Inicializar Embeddings (HuggingFace)
         self.embeddings = HuggingFaceEmbeddings(

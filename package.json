@@ -4,7 +4,8 @@
   "description": "Fullstack Histology RAG with Neo4j + A2UI",
   "scripts": {
     "dev": "docker compose up -d && uv run uvicorn server:app --reload --host 0.0.0.0 --port 10005",
-    "start": "docker compose up -d && uv run python server.py"
+    "start": "docker compose up -d && uv run python server.py",
+    "stop": "docker compose down"
   },
   "author": "",
   "license": "ISC"

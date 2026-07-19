@@ -197,7 +197,7 @@ async def verify_all(do_roundtrip: bool = False, verbose: bool = False):
         if device == "cuda":
             try:
                 cap = torch.cuda.get_device_capability(0)
-                if cap[0] < 7:
+                if cap[0] < 6:
                     print(f"  ⚠️ GPU incompatible (sm_{cap[0]}{cap[1]}), usando CPU")
                     device = "cpu"
             except:

@@ -167,15 +167,28 @@ Se recomienda [Neo4j AuraDB](https://neo4j.com/cloud/aura/) (tier gratuito dispo
 
 ## Ejecución
 
+El sistema utiliza scripts bash que manejan automáticamente el ciclo de vida de Docker y la aplicación.
+
 ```bash
-# Desarrollo (con hot-reload)
+# Iniciar todo el sistema (Neo4j + Servidor Python)
+# - Inicia Neo4j con Docker Compose
+# - Espera hasta que Neo4j esté completamente listo
+# - Inicia el servidor Python con hot-reload
 npm run dev
 
-# Producción
-npm start
+# Detener todo el sistema
+# - Detiene el servidor Python
+# - Detiene Neo4j con Docker Compose
+npm run stop
+
+# Reindexar la base de datos (forzar recarga de PDFs e imágenes)
+# Útil cuando agregas nuevos PDFs o borras la BD
+npm run reindex
 ```
 
 El servidor escucha en `http://localhost:10005`.
+
+**Nota:** El primer inicio puede tardar ~30 segundos mientras Neo4j se inicializa completamente y el sistema indexa los PDFs e imágenes.
 
 ## Cambios v4.2
 
