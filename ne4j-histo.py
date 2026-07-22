@@ -2236,8 +2236,10 @@ class AsistenteHistologiaNeo4j:
         if self.device == "cuda":
             try:
                 cap = torch.cuda.get_device_capability(0)
-                if cap[0] < 6:
-                    print(f"⚠️ GPU incompatible detectada (sm_{cap[0]}{cap[1]}). Forzando CPU para evitar fallback_error.")
+                device_arch = f"sm_{cap[0]}{cap[1]}"
+                arch_list = torch.cuda.get_arch_list()
+                if cap[0] < 6 or (arch_list and device_arch not in arch_list):
+                    print(f"⚠️ GPU incompatible detectada (sm_{cap[0]}{cap[1]} no soportada por esta instalación de PyTorch). Forzando CPU para evitar error.")
                     self.device = "cpu"
             except:
                 pass

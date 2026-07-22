@@ -6,7 +6,7 @@ set -e
 echo "🔄 Reindexación completa de la base de datos..."
 
 # 1. Verificar que Neo4j esté corriendo
-if ! docker ps | grep -q neo4j-local-histo; then
+if ! ./status-neo4j.sh >/dev/null 2>&1; then
     echo "❌ Neo4j no está corriendo. Ejecuta 'npm run dev' primero."
     exit 1
 fi

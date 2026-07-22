@@ -5,9 +5,9 @@ set -e  # Salir si hay error
 
 echo "🚀 Iniciando RAG Histología Neo4j..."
 
-# 1. Iniciar Docker Compose (Neo4j)
-echo "📦 Iniciando Neo4j con Docker Compose..."
-docker compose up -d
+# 1. Iniciar Neo4j Local
+echo "📦 Iniciando Neo4j local..."
+./start-neo4j.sh
 
 # 2. Esperar a que Neo4j esté completamente listo
 echo "⏳ Esperando a que Neo4j esté listo..."
