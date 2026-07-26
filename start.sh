@@ -14,7 +14,7 @@ echo "⏳ Esperando a que Neo4j esté listo..."
 MAX_RETRIES=30
 RETRY_COUNT=0
 
-until curl -s http://localhost:7474 > /dev/null 2>&1; do
+until wget --spider -q http://localhost:7474 > /dev/null 2>&1; do
     RETRY_COUNT=$((RETRY_COUNT + 1))
     if [ $RETRY_COUNT -ge $MAX_RETRIES ]; then
         echo "❌ Neo4j no respondió después de $MAX_RETRIES intentos"

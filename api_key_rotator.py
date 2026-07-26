@@ -109,12 +109,38 @@ google_key_rotator = GoogleApiKeyRotator()
 def set_key_on_llm(llm, key: str):
     """Mutación dinámica e inmediata de la API key en el objeto LLM y sus clientes internos."""
     llm.google_api_key = SecretStr(key)
-    if hasattr(llm, "client") and llm.client is not None:
-        if hasattr(llm.client, "_api_client") and llm.client._api_client is not None:
-            llm.client._api_client.api_key = key
-        if hasattr(llm.client, "aio") and llm.client.aio is not None:
-            if hasattr(llm.client.aio, "_api_client") and llm.client.aio._api_client is not None:
-                llm.client.aio._api_client.api_key = key
+    client = getattr(llm, "client", None)
+    if client is not None:
+        # 1. Mutar el api_key base en _api_client
+        if hasattr(client, "_api_client") and client._api_client is not None:
+            client._api_client.api_key = key
+            # Actualizar también headers en _http_options (necesario en la nueva API google-genai)
+            if hasattr(client._api_client, "_http_options") and client._api_client._http_options is not None:
+                if getattr(client._api_client._http_options, "headers", None) is not None:
+                    client._api_client._http_options.headers["x-goog-api-key"] = key
+
+        # 2. Mutar el api_key en client.models (utilizado para generación síncrona en google-genai)
+        if hasattr(client, "models") and client.models is not None:
+            if hasattr(client.models, "_api_client") and client.models._api_client is not None:
+                client.models._api_client.api_key = key
+                if hasattr(client.models._api_client, "_http_options") and client.models._api_client._http_options is not None:
+                    if getattr(client.models._api_client._http_options, "headers", None) is not None:
+                        client.models._api_client._http_options.headers["x-goog-api-key"] = key
+
+        # 3. Mutar el cliente asincrónico aio y sus sub-clientes
+        aio = getattr(client, "aio", None)
+        if aio is not None:
+            if hasattr(aio, "_api_client") and aio._api_client is not None:
+                aio._api_client.api_key = key
+                if hasattr(aio._api_client, "_http_options") and aio._api_client._http_options is not None:
+                    if getattr(aio._api_client._http_options, "headers", None) is not None:
+                        aio._api_client._http_options.headers["x-goog-api-key"] = key
+            if hasattr(aio, "models") and aio.models is not None:
+                if hasattr(aio.models, "_api_client") and aio.models._api_client is not None:
+                    aio.models._api_client.api_key = key
+                    if hasattr(aio.models._api_client, "_http_options") and aio.models._api_client._http_options is not None:
+                        if getattr(aio.models._api_client._http_options, "headers", None) is not None:
+                            aio.models._api_client._http_options.headers["x-goog-api-key"] = key
 
 
 def create_google_llm(
@@ -149,6 +175,7 @@ def _is_quota_error(exc: Exception) -> bool:
             "not_found", "notfound",
             "resource_exhausted", "resourceexhausted",
             "rate limit", "rate_limit", "quota", "too many requests",
+            "api_key_invalid", "api key not valid", "invalid api key",
         ]
     )
 

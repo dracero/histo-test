@@ -15,7 +15,7 @@ mkdir -p "$LOCAL_DIR"
 # 1. Descargar JDK 21 si no existe
 if [ ! -d "$LOCAL_DIR/jdk" ]; then
     echo "Descargando JDK 21..."
-    curl -L -o "$JDK_TAR" "https://api.adoptium.net/v3/binary/latest/21/ga/linux/x64/jdk/hotspot/normal/eclipse"
+    wget -O "$JDK_TAR" "https://api.adoptium.net/v3/binary/latest/21/ga/linux/x64/jdk/hotspot/normal/eclipse"
     echo "Extrayendo JDK 21..."
     tar -xzf "$JDK_TAR" -C "$LOCAL_DIR/"
     mv "$LOCAL_DIR"/jdk-21* "$LOCAL_DIR/jdk"
@@ -32,7 +32,7 @@ export PATH="$JAVA_HOME/bin:$PATH"
 # 2. Descargar Neo4j Community Server 5.20.0 si no existe
 if [ ! -d "$LOCAL_DIR/neo4j" ]; then
     echo "Descargando Neo4j Community 5.20.0..."
-    curl -L -o "$NEO4J_TAR" "https://dist.neo4j.org/neo4j-community-5.20.0-unix.tar.gz"
+    wget -O "$NEO4J_TAR" "https://dist.neo4j.org/neo4j-community-5.20.0-unix.tar.gz"
     echo "Extrayendo Neo4j..."
     tar -xzf "$NEO4J_TAR" -C "$LOCAL_DIR/"
     mv "$LOCAL_DIR/neo4j-community-5.20.0" "$LOCAL_DIR/neo4j"
